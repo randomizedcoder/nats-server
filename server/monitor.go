@@ -837,6 +837,8 @@ type RouteInfo struct {
 	IsConfigured bool               `json:"is_configured"`
 	IP           string             `json:"ip"`
 	Port         int                `json:"port"`
+	Transport    string             `json:"transport"`             // Transport is the route connection transport, "tcp" or "unix"
+	UnixSocket   string             `json:"unix_socket,omitempty"` // UnixSocket is the peer socket address of a solicited unix route
 	Start        time.Time          `json:"start"`
 	LastActivity time.Time          `json:"last_activity"`
 	RTT          string             `json:"rtt,omitempty"`
@@ -913,11 +915,20 @@ func (s *Server) Routez(routezOpts *RoutezOptions) (*Routez, error) {
 			}
 		}
 
-		switch conn := r.nc.(type) {
-		case *net.TCPConn, *tls.Conn:
-			if addr, ok := conn.RemoteAddr().(*net.TCPAddr); ok {
+		ri.Transport = r.route.transport
+		if r.nc != nil {
+			switch addr := r.nc.RemoteAddr().(type) {
+			case *net.TCPAddr:
 				ri.Port = addr.Port
 				ri.IP = addr.IP.String()
+			case *net.UnixAddr:
+				// The accepting end of a unix socket is unnamed, so only a
+				// solicited route knows the peer's address.
+				if r.route.didSolicit {
+					if ua, ok := unixAddrFromRouteURL(r.route.url); ok {
+						ri.UnixSocket = ua
+					}
+				}
 			}
 		}
 		r.mu.Unlock()
@@ -1321,18 +1332,29 @@ type JetStreamVarz struct {
 
 // ClusterOptsVarz contains monitoring cluster information
 type ClusterOptsVarz struct {
-	Name            string        `json:"name,omitempty"`              // Name is the configured cluster name
-	Host            string        `json:"addr,omitempty"`              // Host is the host the cluster listens on for connections
-	Port            int           `json:"cluster_port,omitempty"`      // Port is the port the cluster listens on for connections
-	AuthTimeout     float64       `json:"auth_timeout,omitempty"`      // AuthTimeout is the time cluster connections have to complete authentication
-	URLs            []string      `json:"urls,omitempty"`              // URLs is the list of cluster URLs
-	TLSTimeout      float64       `json:"tls_timeout,omitempty"`       // TLSTimeout is how long TLS operations have to complete
-	TLSRequired     bool          `json:"tls_required,omitempty"`      // TLSRequired indicates if TLS is required for connections
-	TLSVerify       bool          `json:"tls_verify,omitempty"`        // TLSVerify indicates if full verification of TLS connections is performed
-	PoolSize        int           `json:"pool_size,omitempty"`         // PoolSize is the configured route connection pool size
-	WriteDeadline   time.Duration `json:"write_deadline,omitempty"`    // WriteDeadline is the maximum time writes to sockets have to complete
-	WriteTimeout    string        `json:"write_timeout,omitempty"`     // WriteTimeout is the closure policy for write deadline errors
-	TLSCertNotAfter time.Time     `json:"tls_cert_not_after,omitzero"` // TLSCertNotAfter is the expiration date of the TLS certificate
+	Name            string                `json:"name,omitempty"`              // Name is the configured cluster name
+	Host            string                `json:"addr,omitempty"`              // Host is the host the cluster listens on for connections
+	Port            int                   `json:"cluster_port,omitempty"`      // Port is the port the cluster listens on for connections
+	AuthTimeout     float64               `json:"auth_timeout,omitempty"`      // AuthTimeout is the time cluster connections have to complete authentication
+	URLs            []string              `json:"urls,omitempty"`              // URLs is the list of cluster URLs
+	TLSTimeout      float64               `json:"tls_timeout,omitempty"`       // TLSTimeout is how long TLS operations have to complete
+	TLSRequired     bool                  `json:"tls_required,omitempty"`      // TLSRequired indicates if TLS is required for connections
+	TLSVerify       bool                  `json:"tls_verify,omitempty"`        // TLSVerify indicates if full verification of TLS connections is performed
+	PoolSize        int                   `json:"pool_size,omitempty"`         // PoolSize is the configured route connection pool size
+	WriteDeadline   time.Duration         `json:"write_deadline,omitempty"`    // WriteDeadline is the maximum time writes to sockets have to complete
+	WriteTimeout    string                `json:"write_timeout,omitempty"`     // WriteTimeout is the closure policy for write deadline errors
+	TLSCertNotAfter time.Time             `json:"tls_cert_not_after,omitzero"` // TLSCertNotAfter is the expiration date of the TLS certificate
+	UnixSocket      string                `json:"unix_socket,omitempty"`       // UnixSocket is the unix socket the cluster listens on for route connections, when not TCP
+	UnixSocketStats *RouteUnixSocketStats `json:"unix_socket_stats,omitempty"` // UnixSocketStats are statistics about routes over unix sockets
+}
+
+// RouteUnixSocketStats contains information about route connections over unix domain sockets.
+type RouteUnixSocketStats struct {
+	Accepted     uint64 `json:"accepted"`      // Accepted is how many route connections were accepted on the unix socket listener
+	Dialed       uint64 `json:"dialed"`        // Dialed is how many outbound unix socket route dials succeeded
+	DialErrors   uint64 `json:"dial_errors"`   // DialErrors is how many outbound unix socket route dial attempts failed
+	StaleRemoved uint64 `json:"stale_removed"` // StaleRemoved is how many stale socket files were removed when the listener started
+	Active       int    `json:"active"`        // Active is how many currently connected routes use a unix socket
 }
 
 // GatewayOptsVarz contains monitoring gateway information
@@ -1647,6 +1669,30 @@ func (s *Server) Varz(varzOpts *VarzOptions) (*Varz, error) {
 	return v, nil
 }
 
+// routeUnixSocketStats snapshots the unix socket route counters. It returns
+// nil when the server neither listens on a unix socket nor has ever dialed,
+// accepted or cleaned up one, so a TCP-only server's Varz is unchanged.
+// Server lock is held on entry.
+func (s *Server) routeUnixSocketStats() *RouteUnixSocketStats {
+	st := &RouteUnixSocketStats{
+		Accepted:     s.udsStats.accepted.Load(),
+		Dialed:       s.udsStats.dialed.Load(),
+		DialErrors:   s.udsStats.dialErrors.Load(),
+		StaleRemoved: s.udsStats.staleRemoved.Load(),
+	}
+	s.forEachRoute(func(r *client) {
+		r.mu.Lock()
+		if r.route.transport == routeTransportUnix {
+			st.Active++
+		}
+		r.mu.Unlock()
+	})
+	if s.getOpts().Cluster.UnixSocket == _EMPTY_ && *st == (RouteUnixSocketStats{}) {
+		return nil
+	}
+	return st
+}
+
 // Returns a Varz instance.
 // Server lock is held on entry.
 func (s *Server) createVarz(pcpu float64, rss int64) *Varz {
@@ -1689,6 +1735,7 @@ func (s *Server) createVarz(pcpu float64, rss int64) *Varz {
 			PoolSize:      opts.Cluster.PoolSize,
 			WriteDeadline: opts.Cluster.WriteDeadline,
 			WriteTimeout:  opts.Cluster.WriteTimeout.String(),
+			UnixSocket:    c.UnixSocket,
 		},
 		Gateway: GatewayOptsVarz{
 			Name:           gw.Name,
@@ -1811,7 +1858,12 @@ func (s *Server) varzLeafNodeRemotes(opts *Options) []RemoteLeafOptsVarz {
 func urlsToStrings(urls []*url.URL) []string {
 	sURLs := make([]string, len(urls))
 	for i, u := range urls {
-		sURLs[i] = u.Host
+		if addr, ok := unixAddrFromRouteURL(u); ok {
+			// A unix route URL has no host; report it in its URL form.
+			sURLs[i] = unixRouteURL(addr).String()
+		} else {
+			sURLs[i] = u.Host
+		}
 	}
 	return sURLs
 }
@@ -1943,6 +1995,7 @@ func (s *Server) updateVarzRuntimeFields(v *Varz, forceUpdate bool, pcpu float64
 		Leafs:    s.NumStaleConnectionsLeafs(),
 	}
 	v.PinnedAccountFail = atomic.LoadUint64(&s.pinnedAccFail)
+	v.Cluster.UnixSocketStats = s.routeUnixSocketStats()
 
 	// Make sure to reset in case we are re-using.
 	v.Subscriptions = 0

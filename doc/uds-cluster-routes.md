@@ -170,7 +170,7 @@ New fields (all `omitempty`, each with the inline `//` doc comment `monitor.go` 
 | Struct | Field | JSON | Meaning |
 |---|---|---|---|
 | `ClusterOptsVarz` | `UnixSocket string` | `unix_socket` | Listener socket (URL form) when the route listener is a UDS. |
-| `ClusterOptsVarz` | `UnixSocketStats *RouteUnixSocketStats` | `unix_socket_stats` | Counters below. Nil when every counter is zero, matching `SlowConsumersStats`. |
+| `ClusterOptsVarz` | `UnixSocketStats *RouteUnixSocketStats` | `unix_socket_stats` | Counters below. Nil unless the listener is a unix socket or any counter is non-zero, so a TCP-only server's `/varz` is byte-identical to today. |
 | `RouteUnixSocketStats` | `Accepted uint64` | `accepted` | Route connections accepted on the UDS listener. |
 | `RouteUnixSocketStats` | `Dialed uint64` | `dialed` | Successful outbound UDS route dials. |
 | `RouteUnixSocketStats` | `DialErrors uint64` | `dial_errors` | Failed outbound UDS route dials (per attempt). |
@@ -178,7 +178,7 @@ New fields (all `omitempty`, each with the inline `//` doc comment `monitor.go` 
 | `RouteUnixSocketStats` | `Active int` | `active` | Currently connected routes whose transport is UDS. |
 | `RouteInfo` (routez) | `Transport string` | `transport` | `"tcp"` or `"unix"`. Always set. |
 | `RouteInfo` (routez) | `UnixSocket string` | `unix_socket` | Peer socket path for solicited UDS routes; empty for accepted UDS routes because the peer end is unnamed. `IP`/`Port` are left zero. |
-| `RouteStat` (STATSZ) | `Transport string` | `transport` | Same as above so system-account consumers (e.g. `nats-surveyor`) can split traffic by transport. |
+| `RouteStat` (STATSZ) | `Transport string` | `transport` | Same as above (`omitempty`, only empty for a route with no connection) so system-account consumers (e.g. `nats-surveyor`) can split traffic by transport. |
 | `Ports.Cluster` (ports file) | existing `[]string` | `cluster` | Gains entries of the form `unix:///run/nats/a.sock`. |
 
 Counters live on a new `udsStats` struct embedded in `Server` next to `scStats` and
@@ -200,7 +200,7 @@ server lock by `forEachRoute`.
 
 | File | Build tag | Contents |
 |---|---|---|
-| `server/uds.go` | none | `parseUnixAddr`, `unixRouteURL`, `unixAddrFromRouteURL`, `isUnixRouteURL`, `listenRouteUnix`, `dialRouteUnix`, stale-socket handling, `udsStats`. |
+| `server/uds.go` | none | `parseUnixAddr`, `unixRouteURL`, `unixAddrFromRouteURL`, `isUnixRouteURL`, `listenRouteUnix`, `routeTransport`, stale-socket handling, `udsStats`. |
 | `server/uds_unix.go` | `//go:build !windows` | `nativeUnixAddr` (identity), `isConnRefused` via `errors.Is(err, syscall.ECONNREFUSED)`. |
 | `server/uds_windows.go` | `//go:build windows` | `nativeUnixAddr` (strip `/` before drive letter, `filepath.FromSlash`), `isConnRefused` via `windows.WSAECONNREFUSED` from `golang.org/x/sys` (already a dependency). |
 | `server/uds_sockaddr.go` | `//go:build !wasm` | `const maxUnixSocketPathLen = len(syscall.RawSockaddrUnix{}.Path)`. |
@@ -306,7 +306,7 @@ UDS dial path (§4.4) checks it before dialing and returns immediately, mirrorin
 ```go
 if addr, ok := unixAddrFromRouteURL(rURL); ok {
     if s.isUnixRouteToSelf(addr) { return }
-    conn, err = s.dialRouteUnix(addr, DEFAULT_ROUTE_DIAL)   // natsDialTimeout("unix", nativeUnixAddr(addr), ...)
+    conn, err = natsDialTimeout("unix", nativeUnixAddr(addr), DEFAULT_ROUTE_DIAL)
 } else {
     address, err := s.getRandomIP(...)                      // unchanged
     ...

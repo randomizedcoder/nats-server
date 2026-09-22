@@ -180,6 +180,23 @@ var errRouteTLSUnixNoName = errors.New("TLS route over unix socket requires clus
 // (nothing listening, ECONNREFUSED) from one that is in use.
 const unixStaleProbeTimeout = 250 * time.Millisecond
 
+// Route transport names reported by /varz, /routez and STATSZ.
+const (
+	routeTransportTCP  = "tcp"
+	routeTransportUnix = "unix"
+)
+
+// routeTransport names the transport of a route connection from its
+// remote address: "unix" for unix domain sockets, "tcp" otherwise.
+func routeTransport(nc net.Conn) string {
+	if nc != nil {
+		if _, ok := nc.RemoteAddr().(*net.UnixAddr); ok {
+			return routeTransportUnix
+		}
+	}
+	return routeTransportTCP
+}
+
 // listenRouteUnix binds the route listener to the unix domain socket at the
 // URL-form address addr produced by parseUnixAddr. For a pathname socket a
 // stale file left behind by a crashed server is removed first; anything that

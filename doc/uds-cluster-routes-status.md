@@ -16,7 +16,7 @@ Last updated: 2026-09-22
 | 2 | Options, flags, validation, reload rejection | `[x]` | Committed. |
 | 3 | Listener, stale socket, self-route map, accessors | `[x]` | Committed. |
 | 4 | Dial, gossip, INFO, TLS name fallback | `[x]` | Committed. `sendRouteConnect` cluster-auth fallback added for explicit unix routes. |
-| 5 | Monitoring fields and counters | `[~]` | |
+| 5 | Monitoring fields and counters | `[x]` | Committed. Stopped here for review before phases 6-7. |
 | 6 | Multi-process configs, script, docs | `[ ]` | |
 | 7 | PR: draft, squash, sign-off, evidence | `[ ]` | |
 
@@ -134,18 +134,18 @@ Tests:
 
 Files: `server/server.go`, `server/monitor.go`, `server/events.go`
 
-- [ ] `udsStats` struct embedded in `Server` at the aligned head, `atomic.Uint64` fields
-- [ ] Increments at accept, dial success, dial failure, stale removal
-- [ ] `RouteUnixSocketStats` type; `ClusterOptsVarz.UnixSocket` and `.UnixSocketStats`
-- [ ] `updateVarzRuntimeFields` copies counters; `Active` via `forEachRoute`
-- [ ] `RouteInfo.Transport` and `.UnixSocket`; `Routez` switch on `RemoteAddr().(type)`
-- [ ] `RouteStat.Transport` in STATSZ
-- [ ] Inline `//` doc comment on every new field (monitor.go convention)
+- [x] `udsStats` struct embedded in `Server` at the aligned head, `atomic.Uint64` fields (phase 3)
+- [x] Increments at accept, dial success, dial failure, stale removal (`dialed` counted attempts until phase 5; now successes only, per §3.3)
+- [x] `RouteUnixSocketStats` type; `ClusterOptsVarz.UnixSocket` and `.UnixSocketStats` (both `omitempty`; stats nil unless unix listener or non-zero counter)
+- [x] `updateVarzRuntimeFields` copies counters via `routeUnixSocketStats()`; `Active` via `forEachRoute` reading `route.transport`
+- [x] `RouteInfo.Transport` and `.UnixSocket`; `Routez` switch on `RemoteAddr().(type)` (nil-safe when the connection is gone); `route.transport` captured in `createRoute` via `routeTransport(conn)`
+- [x] `RouteStat.Transport` in STATSZ
+- [x] Inline `//` doc comment on every new field (monitor.go convention); `TestMonitorVarz` positional `ClusterOptsVarz` guard literal extended
 
 Tests:
 
-- [ ] §6.10 `TestRouteUnixMonitoring`
-- [ ] Golden `/varz` JSON for a TCP-only server unchanged
+- [x] §6.10 `TestRouteUnixMonitoring` (varz listener/counters/dial errors, routez unix and tcp regression, STATSZ both transports, ports file, counters after dialer restart, stale removal, transport kept after close) over HTTP and API modes; `TestRouteTransport` table
+- [x] Golden `/varz` JSON for a TCP-only server unchanged (`TestVarzClusterTCPGolden`)
 
 ## Phase 6: multi-process integration (§7.2, §7.3)
 
@@ -205,11 +205,45 @@ $ go test -count=1 -p=1 ./server -run TestNoRaceRouteUnix -tags=skip_no_race_1_t
 --- PASS: TestNoRaceRouteUnixThreeServerMeshTraffic (0.58s)
 ```
 
+Phase 5 (2026-09-22), three `nats-server` processes, full explicit mesh over unix sockets
+(default `pool_size`, so 3 pooled + 1 system-account route per peer), started
+simultaneously so some early dials fail and are retried:
+
+```
+$ nats-server -t -c a.conf
+nats-server: configuration file a.conf is valid (sha256:87237a16...)
+$ curl -s http://127.0.0.1:$PORT_A/routez | jq '{num_routes, t: [.routes[].transport] | unique}'
+{"num_routes": 8, "t": ["unix"]}
+$ curl -s http://127.0.0.1:$PORT_A/varz | jq .cluster
+{"name":"uds","auth_timeout":2,"urls":["unix:///tmp/nuds/b.sock","unix:///tmp/nuds/c.sock"],
+ "tls_timeout":2,"pool_size":3,"unix_socket":"/tmp/nuds/a.sock",
+ "unix_socket_stats":{"accepted":4,"dialed":8,"dial_errors":0,"stale_removed":0,"active":8}}
+$ ss -xlp | grep nuds
+u_str LISTEN 0 4096 /tmp/nuds/b.sock ... users:(("nats-server",pid=276649,fd=8))
+u_str LISTEN 0 4096 /tmp/nuds/c.sock ... users:(("nats-server",pid=276650,fd=8))
+u_str LISTEN 0 4096 /tmp/nuds/a.sock ... users:(("nats-server",pid=276648,fd=8))
+$ ss -xp | grep -c nuds        # established route connections, both ends
+12
+$ pkill -TERM nats-server; ls /tmp/nuds | wc -l
+0
+```
+
+The first attempt used the session scratchpad directory and was rejected by `-t` with
+`unix socket address "unix:///tmp/claude-.../a.sock" is too long: 114 bytes, max is 107`,
+which is the intended length rule. The smoke also exposed that `/varz` `cluster.urls`
+rendered unix routes as empty strings (`urlsToStrings` used `u.Host`); fixed in phase 5.
+
 Pre-existing on `main` (`edb1b17a`), not caused by this branch: `TestRouteSlowConsumerRecover`
 fails on this machine (`Expected Slow Consumer routes`, bandwidth-shaping proxy timing).
 `TestClusteredInterestConsumerFilterEdit` (JetStream over TCP routes, hard message-count
 assertions with no retry) failed once in a full `-race` run of `TestRoute|TestUnix|TestCluster`
 and passed 8/8 isolated reruns and a second full run; timing under load, unrelated to transport.
+`TestRoutePoolConnectRace` and `TestRoutePerAccountConnectRace` (TCP route pools) failed once
+when the `-race` suite ran concurrently with a second `-race` suite, golangci-lint and the
+no-race fan-out; 3/3 isolated reruns and a solo rerun of the full suite passed.
+
+Phase 5 (2026-09-22), `golangci-lint run --config=.golangci.yml ./server/...`: clean after
+fixing one `misspell` finding in a test comment.
 
 ## Session log
 
@@ -220,3 +254,4 @@ and passed 8/8 isolated reruns and a second full run; timing under load, unrelat
 | 2026-09-22 | Phase 2 done: `UnixSocket` field, `listenEnabled()` at all 12 sites, parse-time and `validateCluster` transport rules, `routesFromStr` error variant for `-routes`, `overrideCluster` unix branch, reload rejection. Fixed phase-1 length rule (pathname limit is `sun_path`-1, abstract is `sun_path`, matching Go's `SockaddrUnix`). Found the conf lexer accepts unquoted `unix:///...`. `-race` green on config/options/reload sets; `./test` route suite green. Committed. | Phase 3: `listenRouteUnix`, `startRouteAcceptLoop` transport switch, accessors, `unixRoutesToSelf`, real-socket tests. |
 | 2026-09-22 | Phase 3 done: `listenRouteUnix`/`removeStaleUnixSocket` (Lstat, not-a-socket, probe, `isConnRefused`, remove + warn + counter), accept loop transport switch, `udsStats` embedded, `unixRoutesToSelf`, `ClusterUnixAddr`/`ClusterListenAddr`, `formatURL` unix branch with `urlUnixAddr` inverse per OS, `initClient` host from `*net.UnixAddr`. Real-socket tables green under `-race`; route/client/ports regressions and `./test` suites green. Committed. | Phase 4: `setRouteInfoHostPortAndIP`, `connectToRoute` unix dial, `processRouteInfo`/`processImplicitRoute`/`hasThisRouteConfigured`, TLS name fallback, three-server mesh tests. |
 | 2026-09-22 | Phase 4 done: `setRouteInfoHostPortAndIP` transport cases, `connectToRoute` unix dial with self skip and counters, `processRouteInfo`/`processImplicitRoute`/`hasThisRouteConfigured` unix `info.IP` handling, `saveRouteTLSName` skip, `doTLSHandshake` name fallback and `errRouteTLSUnixNoName`, `sendRouteConnect` cluster-auth fallback for explicit unix routes (design gap found by test; §3.1 updated). Dial, reload, TLS, mesh and topology tables plus 100k-message no-race fan-out green; `-race` on route/unix/cluster sets and `./test` suites green; windows vet, wasm/darwin/freebsd builds ok. Committed. | Phase 5: `route.transport`, Varz `UnixSocket`/`UnixSocketStats`, Routez `Transport`/`UnixSocket`, STATSZ `RouteStat.Transport`, `TestRouteUnixMonitoring`, golden TCP `/varz` fragment. |
+| 2026-09-22 | Phase 5 done: `route.transport` captured at creation, `RouteUnixSocketStats` and `ClusterOptsVarz.UnixSocket`/`UnixSocketStats` (nil for TCP-only servers, golden test), `RouteInfo.Transport`/`UnixSocket` with nil-safe `Routez` address switch, `RouteStat.Transport` in STATSZ. Fixed `dialed` to count successes only (design §3.3). `/varz` `cluster.urls` now renders unix routes (found by the three-process smoke). Monitoring tables over HTTP and API green under `-race`; monitor/varz/routez/events regressions, `./test` suites, cross builds and golangci-lint checked. Committed. Stopped for review. | Review phases 1-5; then phase 6 (multi-process configs, `scripts/uds-cluster-smoke.sh`, `ss -xp` evidence) and phase 7 (issue, draft PR). |

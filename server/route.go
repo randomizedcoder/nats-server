@@ -87,6 +87,9 @@ type route struct {
 	// Selected compression mode, which may be different from the
 	// server configured mode.
 	compression string
+	// Transport of the underlying connection, "tcp" or "unix", captured
+	// at creation so monitoring can report it after the connection is gone.
+	transport string
 	// Transient value used to set the Info.GossipMode when initiating
 	// an implicit route and sending to the remote.
 	gossipMode byte
@@ -2024,7 +2027,7 @@ func (s *Server) createRoute(conn net.Conn, rURL *url.URL, rtype RouteType, goss
 	opts := s.getOpts()
 
 	didSolicit := rURL != nil
-	r := &route{routeType: rtype, didSolicit: didSolicit, poolIdx: -1, gossipMode: gossipMode}
+	r := &route{routeType: rtype, didSolicit: didSolicit, poolIdx: -1, gossipMode: gossipMode, transport: routeTransport(conn)}
 
 	c := &client{srv: s, nc: conn, opts: ClientOpts{}, kind: ROUTER, msubs: -1, mpay: -1, route: r, start: time.Now()}
 
@@ -3082,10 +3085,11 @@ func (s *Server) connectToRoute(rURL *url.URL, rtype RouteType, firstConnect boo
 		var err error
 		if isUnix {
 			s.Debugf("Trying to connect to route on unix socket %s%s", unixSchemePrefix, unixAddr)
-			s.udsStats.dialed.Add(1)
 			conn, err = natsDialTimeout("unix", nativeUnixAddr(unixAddr), DEFAULT_ROUTE_DIAL)
 			if err != nil {
 				s.udsStats.dialErrors.Add(1)
+			} else {
+				s.udsStats.dialed.Add(1)
 			}
 		} else {
 			var address string

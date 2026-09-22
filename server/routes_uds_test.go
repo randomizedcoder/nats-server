@@ -14,11 +14,13 @@
 package server
 
 import (
+	"encoding/json"
 	"fmt"
 	"net"
 	"net/url"
 	"os"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"sort"
 	"strings"
@@ -1021,13 +1023,18 @@ func TestRouteUnixDial(t *testing.T) {
 		case <-time.After(2 * time.Second):
 			t.Fatal("peer was not dialed")
 		}
-		// The listener is gone now, so the reconnects fail and are counted.
+		// The listener is gone now, so the reconnects fail and are counted
+		// as dial errors. (A reconnect racing the listener close may still
+		// connect into the backlog, so the successful count is not exact.)
 		checkFor(t, 2*time.Second, 10*time.Millisecond, func() error {
-			if n := sa.udsStats.dialed.Load(); n < 2 {
-				return fmt.Errorf("dialed = %d, expected a reconnect attempt", n)
+			if n := sa.udsStats.dialErrors.Load(); n < 1 {
+				return fmt.Errorf("dialErrors = %d, expected a failed reconnect attempt", n)
 			}
 			return nil
 		})
+		if n := sa.udsStats.dialed.Load(); n == 0 {
+			t.Fatal("dialed = 0, expected the accepted dial to be counted")
+		}
 	})
 }
 
@@ -1398,6 +1405,439 @@ func TestRouteUnixMeshTopologies(t *testing.T) {
 			// Stay formed: gossip must not tear down or duplicate routes.
 			time.Sleep(200 * time.Millisecond)
 			checkClusterFormed(t, sa, sb, sc)
+		})
+	}
+}
+
+// monitoringUnixPair starts an acceptor B on a unix socket and a dialer A
+// with an explicit route to it, both with an HTTP monitor and a system
+// account user, and waits for the cluster to form. With pool_size -1 each
+// side has exactly one route.
+func monitoringUnixPair(t *testing.T) (sa, sb *Server, oa, ob *Options) {
+	t.Helper()
+	ob = defaultUnixClusterOptions(t, "b.sock")
+	monitoringOptions(ob)
+	sb = RunServer(ob)
+	t.Cleanup(sb.Shutdown)
+
+	oa = defaultUnixClusterOptions(t, "a.sock")
+	monitoringOptions(oa)
+	oa.Routes = []*url.URL{unixRouteURL(ob.Cluster.UnixSocket)}
+	sa = RunServer(oa)
+	t.Cleanup(sa.Shutdown)
+
+	checkClusterFormed(t, sa, sb)
+	return sa, sb, oa, ob
+}
+
+// monitoringOptions enables the HTTP monitor, disables route pooling and
+// adds a system account user so STATSZ can be requested.
+func monitoringOptions(o *Options) {
+	o.HTTPHost = "127.0.0.1"
+	o.HTTPPort = -1
+	o.Cluster.PoolSize = -1
+	sys := NewAccount("SYS")
+	o.Accounts = []*Account{sys}
+	o.SystemAccount = "SYS"
+	o.Users = []*User{{Username: "sys", Password: "pwd", Account: sys}}
+}
+
+// statszRoutes requests STATSZ from a server through its system account
+// and returns the route stats it reports.
+func statszRoutes(t *testing.T, s *Server) []*RouteStat {
+	t.Helper()
+	nc, err := nats.Connect(s.ClientURL(), nats.UserInfo("sys", "pwd"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer nc.Close()
+	msg, err := nc.Request("$SYS.REQ.SERVER.PING.STATSZ", nil, 2*time.Second)
+	if err != nil {
+		t.Fatalf("STATSZ request failed: %v", err)
+	}
+	var m ServerStatsMsg
+	if err := json.Unmarshal(msg.Data, &m); err != nil {
+		t.Fatalf("unable to decode STATSZ: %v", err)
+	}
+	return m.Stats.Routes
+}
+
+// varzModes polls /varz over HTTP and through the Server API and hands
+// both results to check, so JSON encoding and the in-process struct are
+// covered by the same assertions.
+func varzModes(t *testing.T, s *Server, check func(t *testing.T, v *Varz)) {
+	t.Helper()
+	for mode, name := range []string{"http", "api"} {
+		t.Run(name, func(t *testing.T) {
+			v := pollVarz(t, s, mode, fmt.Sprintf("http://127.0.0.1:%d/varz", s.MonitorAddr().Port), nil)
+			check(t, v)
+		})
+	}
+}
+
+// routezModes is varzModes for /routez.
+func routezModes(t *testing.T, s *Server, check func(t *testing.T, rz *Routez)) {
+	t.Helper()
+	for mode, name := range []string{"http", "api"} {
+		t.Run(name, func(t *testing.T) {
+			rz := pollRoutez(t, s, mode, fmt.Sprintf("http://127.0.0.1:%d/routez", s.MonitorAddr().Port), nil)
+			check(t, rz)
+		})
+	}
+}
+
+// TestRouteUnixMonitoring covers the /varz, /routez, PortsInfo and STATSZ
+// reporting of unix socket routes (design doc §6.10).
+func TestRouteUnixMonitoring(t *testing.T) {
+	skipIfNoUnixSockets(t)
+	resetPreviousHTTPConnections()
+
+	t.Run("varz reports the unix listener instead of host and port", func(t *testing.T) {
+		sa, _, oa, ob := monitoringUnixPair(t)
+		varzModes(t, sa, func(t *testing.T, v *Varz) {
+			if v.Cluster.UnixSocket != oa.Cluster.UnixSocket {
+				t.Fatalf("cluster.unix_socket = %q, expected %q", v.Cluster.UnixSocket, oa.Cluster.UnixSocket)
+			}
+			if v.Cluster.Host != _EMPTY_ || v.Cluster.Port != 0 {
+				t.Fatalf("cluster addr/port = %q/%d, expected empty", v.Cluster.Host, v.Cluster.Port)
+			}
+			if expected := []string{unixSchemePrefix + ob.Cluster.UnixSocket}; !reflect.DeepEqual(v.Cluster.URLs, expected) {
+				t.Fatalf("cluster urls = %q, expected %q", v.Cluster.URLs, expected)
+			}
+		})
+		body := string(readBody(t, fmt.Sprintf("http://127.0.0.1:%d/varz", sa.MonitorAddr().Port)))
+		for _, absent := range []string{`"cluster_port"`, `"addr"`} {
+			if strings.Contains(body, absent) {
+				t.Fatalf("/varz should omit %s for a unix listener", absent)
+			}
+		}
+		if !strings.Contains(body, `"unix_socket": "`+oa.Cluster.UnixSocket+`"`) {
+			t.Fatalf("/varz should report the unix socket, got:\n%s", body)
+		}
+	})
+
+	t.Run("varz counters", func(t *testing.T) {
+		sa, sb, _, _ := monitoringUnixPair(t)
+		for _, tc := range []struct {
+			description string
+			s           *Server
+			expected    RouteUnixSocketStats
+		}{
+			{description: "dialer", s: sa, expected: RouteUnixSocketStats{Dialed: 1, Active: 1}},
+			{description: "acceptor", s: sb, expected: RouteUnixSocketStats{Accepted: 1, Active: 1}},
+		} {
+			t.Run(tc.description, func(t *testing.T) {
+				varzModes(t, tc.s, func(t *testing.T, v *Varz) {
+					if v.Cluster.UnixSocketStats == nil {
+						t.Fatal("expected unix_socket_stats to be present")
+					}
+					if got := *v.Cluster.UnixSocketStats; got != tc.expected {
+						t.Fatalf("unix_socket_stats = %+v, expected %+v", got, tc.expected)
+					}
+				})
+			})
+		}
+	})
+
+	t.Run("varz dial errors are counted for a missing peer", func(t *testing.T) {
+		oa := defaultUnixClusterOptions(t, "a.sock")
+		monitoringOptions(oa)
+		oa.Routes = []*url.URL{unixRouteURL(tempSocketPath(t, "missing.sock"))}
+		sa := RunServer(oa)
+		defer sa.Shutdown()
+		checkFor(t, 2*time.Second, 10*time.Millisecond, func() error {
+			v, _ := sa.Varz(nil)
+			st := v.Cluster.UnixSocketStats
+			switch {
+			case st == nil:
+				return fmt.Errorf("expected unix_socket_stats")
+			case st.DialErrors == 0:
+				return fmt.Errorf("expected dial_errors to move")
+			case st.Dialed != 0 || st.Active != 0 || st.Accepted != 0:
+				return fmt.Errorf("unexpected counters %+v", *st)
+			}
+			return nil
+		})
+	})
+
+	t.Run("routez reports the unix transport", func(t *testing.T) {
+		sa, sb, _, ob := monitoringUnixPair(t)
+		for _, tc := range []struct {
+			description        string
+			s                  *Server
+			expectedSolicit    bool
+			expectedUnixSocket string
+		}{
+			{description: "dialer knows the peer socket", s: sa, expectedSolicit: true, expectedUnixSocket: ob.Cluster.UnixSocket},
+			{description: "acceptor sees an unnamed peer", s: sb, expectedSolicit: false, expectedUnixSocket: _EMPTY_},
+		} {
+			t.Run(tc.description, func(t *testing.T) {
+				routezModes(t, tc.s, func(t *testing.T, rz *Routez) {
+					if len(rz.Routes) != 1 {
+						t.Fatalf("expected 1 route, got %d", len(rz.Routes))
+					}
+					ri := rz.Routes[0]
+					if ri.Transport != routeTransportUnix {
+						t.Fatalf("transport = %q, expected %q", ri.Transport, routeTransportUnix)
+					}
+					if ri.IP != _EMPTY_ || ri.Port != 0 {
+						t.Fatalf("ip/port = %q/%d, expected empty", ri.IP, ri.Port)
+					}
+					if ri.DidSolicit != tc.expectedSolicit {
+						t.Fatalf("did_solicit = %v, expected %v", ri.DidSolicit, tc.expectedSolicit)
+					}
+					if ri.UnixSocket != tc.expectedUnixSocket {
+						t.Fatalf("unix_socket = %q, expected %q", ri.UnixSocket, tc.expectedUnixSocket)
+					}
+				})
+			})
+		}
+	})
+
+	t.Run("routez tcp regression", func(t *testing.T) {
+		ob := DefaultOptions()
+		monitoringOptions(ob)
+		sb := RunServer(ob)
+		defer sb.Shutdown()
+		oa := DefaultOptions()
+		monitoringOptions(oa)
+		oa.Routes = RoutesFromStr(fmt.Sprintf("nats-route://127.0.0.1:%d", ob.Cluster.Port))
+		sa := RunServer(oa)
+		defer sa.Shutdown()
+		checkClusterFormed(t, sa, sb)
+
+		for _, tc := range []struct {
+			description  string
+			s            *Server
+			expectedPort int
+		}{
+			{description: "dialer reports the listener port", s: sa, expectedPort: ob.Cluster.Port},
+			{description: "acceptor reports an ephemeral port", s: sb},
+		} {
+			t.Run(tc.description, func(t *testing.T) {
+				routezModes(t, tc.s, func(t *testing.T, rz *Routez) {
+					if len(rz.Routes) != 1 {
+						t.Fatalf("expected 1 route, got %d", len(rz.Routes))
+					}
+					ri := rz.Routes[0]
+					if ri.Transport != routeTransportTCP {
+						t.Fatalf("transport = %q, expected %q", ri.Transport, routeTransportTCP)
+					}
+					if ri.IP != "127.0.0.1" || ri.Port == 0 {
+						t.Fatalf("ip/port = %q/%d, expected 127.0.0.1 and a port", ri.IP, ri.Port)
+					}
+					if tc.expectedPort != 0 && ri.Port != tc.expectedPort {
+						t.Fatalf("port = %d, expected %d", ri.Port, tc.expectedPort)
+					}
+					if ri.UnixSocket != _EMPTY_ {
+						t.Fatalf("unix_socket = %q, expected empty", ri.UnixSocket)
+					}
+				})
+			})
+		}
+		// A TCP-only server never reports unix socket stats.
+		varzModes(t, sa, func(t *testing.T, v *Varz) {
+			if v.Cluster.UnixSocket != _EMPTY_ || v.Cluster.UnixSocketStats != nil {
+				t.Fatalf("unexpected unix fields in tcp varz: %q %+v", v.Cluster.UnixSocket, v.Cluster.UnixSocketStats)
+			}
+		})
+		for _, s := range []*Server{sa, sb} {
+			for _, rs := range statszRoutes(t, s) {
+				if rs.Transport != routeTransportTCP {
+					t.Fatalf("%s STATSZ route transport = %q, expected %q", s.Name(), rs.Transport, routeTransportTCP)
+				}
+			}
+		}
+	})
+
+	t.Run("statsz reports the unix transport", func(t *testing.T) {
+		sa, sb, _, _ := monitoringUnixPair(t)
+		for _, s := range []*Server{sa, sb} {
+			routes := statszRoutes(t, s)
+			if len(routes) != 1 {
+				t.Fatalf("%s: expected 1 route in STATSZ, got %d", s.Name(), len(routes))
+			}
+			if routes[0].Transport != routeTransportUnix {
+				t.Fatalf("%s: STATSZ route transport = %q, expected %q", s.Name(), routes[0].Transport, routeTransportUnix)
+			}
+		}
+	})
+
+	t.Run("ports file lists the unix socket", func(t *testing.T) {
+		sa, _, oa, _ := monitoringUnixPair(t)
+		ports := sa.PortsInfo(time.Second)
+		expected := []string{unixSchemePrefix + oa.Cluster.UnixSocket}
+		if !reflect.DeepEqual(ports.Cluster, expected) {
+			t.Fatalf("PortsInfo().Cluster = %v, expected %v", ports.Cluster, expected)
+		}
+	})
+
+	t.Run("counters after the dialer restarts", func(t *testing.T) {
+		sa, sb, oa, _ := monitoringUnixPair(t)
+		sa.Shutdown()
+		sa.WaitForShutdown()
+		checkFor(t, 2*time.Second, 10*time.Millisecond, func() error {
+			v, _ := sb.Varz(nil)
+			if st := v.Cluster.UnixSocketStats; st == nil || st.Active != 0 {
+				return fmt.Errorf("expected no active unix routes after the dialer left")
+			}
+			return nil
+		})
+		sa2 := RunServer(oa)
+		defer sa2.Shutdown()
+		checkClusterFormed(t, sa2, sb)
+
+		for _, tc := range []struct {
+			description string
+			s           *Server
+			expected    RouteUnixSocketStats
+		}{
+			{description: "acceptor counted both connections", s: sb, expected: RouteUnixSocketStats{Accepted: 2, Active: 1}},
+			{description: "restarted dialer starts from zero", s: sa2, expected: RouteUnixSocketStats{Dialed: 1, Active: 1}},
+		} {
+			t.Run(tc.description, func(t *testing.T) {
+				v, _ := tc.s.Varz(nil)
+				if v.Cluster.UnixSocketStats == nil {
+					t.Fatal("expected unix_socket_stats")
+				}
+				if got := *v.Cluster.UnixSocketStats; got != tc.expected {
+					t.Fatalf("unix_socket_stats = %+v, expected %+v", got, tc.expected)
+				}
+			})
+		}
+	})
+
+	t.Run("counters after a stale socket is removed", func(t *testing.T) {
+		o := defaultUnixClusterOptions(t, "stale.sock")
+		monitoringOptions(o)
+		leaveStaleSocket(t, nativeUnixAddr(o.Cluster.UnixSocket))
+		s := RunServer(o)
+		defer s.Shutdown()
+		varzModes(t, s, func(t *testing.T, v *Varz) {
+			expected := RouteUnixSocketStats{StaleRemoved: 1}
+			if v.Cluster.UnixSocketStats == nil {
+				t.Fatal("expected unix_socket_stats")
+			}
+			if got := *v.Cluster.UnixSocketStats; got != expected {
+				t.Fatalf("unix_socket_stats = %+v, expected %+v", got, expected)
+			}
+		})
+	})
+
+	t.Run("routez after the peer closes keeps the transport", func(t *testing.T) {
+		// The transport is captured at creation, so a route whose
+		// connection is already gone still reports it.
+		r := &client{kind: ROUTER, route: &route{transport: routeTransportUnix}}
+		if got := routeStat(r).Transport; got != routeTransportUnix {
+			t.Fatalf("routeStat transport = %q, expected %q", got, routeTransportUnix)
+		}
+	})
+}
+
+// TestRouteTransport covers routeTransport over the connection types a
+// route can have.
+func TestRouteTransport(t *testing.T) {
+	skipIfNoUnixSockets(t)
+	unixPath := nativeUnixAddr(tempSocketPath(t, "t.sock"))
+	ul, err := net.Listen("unix", unixPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ul.Close()
+	tl, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tl.Close()
+	dial := func(network, addr string) net.Conn {
+		c, err := net.Dial(network, addr)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { c.Close() })
+		return c
+	}
+	for _, tc := range []struct {
+		description string
+		nc          net.Conn
+		expected    string
+	}{
+		// positive
+		{description: "unix connection", nc: dial("unix", unixPath), expected: routeTransportUnix},
+		{description: "tcp connection", nc: dial("tcp", tl.Addr().String()), expected: routeTransportTCP},
+		// negative / corner
+		{description: "nil connection defaults to tcp", nc: nil, expected: routeTransportTCP},
+		{description: "fake connection with a tcp address", nc: &fakeConn{addr: &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 1}}, expected: routeTransportTCP},
+		{description: "fake connection with a unix address", nc: &fakeConn{addr: &net.UnixAddr{Name: "/x", Net: "unix"}}, expected: routeTransportUnix},
+	} {
+		t.Run(tc.description, func(t *testing.T) {
+			if got := routeTransport(tc.nc); got != tc.expected {
+				t.Fatalf("routeTransport = %q, expected %q", got, tc.expected)
+			}
+		})
+	}
+}
+
+// fakeConn is a net.Conn that only knows its remote address.
+type fakeConn struct {
+	net.Conn
+	addr net.Addr
+}
+
+func (f *fakeConn) RemoteAddr() net.Addr { return f.addr }
+
+// TestVarzClusterTCPGolden pins the /varz cluster fragment of a TCP-only
+// server so the unix socket fields never leak into it.
+func TestVarzClusterTCPGolden(t *testing.T) {
+	resetPreviousHTTPConnections()
+	o := DefaultOptions()
+	o.Cluster.Name = "abc"
+	o.Cluster.Host = "127.0.0.1"
+	o.HTTPHost = "127.0.0.1"
+	o.HTTPPort = -1
+	s := RunServer(o)
+	defer s.Shutdown()
+
+	expected := fmt.Sprintf(`{"name":"abc","addr":"127.0.0.1","cluster_port":%d,"auth_timeout":2,"tls_timeout":2,"pool_size":3}`, o.Cluster.Port)
+	varzModes(t, s, func(t *testing.T, v *Varz) {
+		b, err := json.Marshal(v.Cluster)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(b) != expected {
+			t.Fatalf("cluster varz = %s, expected %s", b, expected)
+		}
+	})
+	body := string(readBody(t, fmt.Sprintf("http://127.0.0.1:%d/varz", s.MonitorAddr().Port)))
+	if strings.Contains(body, "unix") {
+		t.Fatalf("/varz of a tcp-only server mentions unix:\n%s", body)
+	}
+}
+
+// TestURLsToStringsUnix covers the /varz route URL rendering for unix,
+// TCP and mixed route lists.
+func TestURLsToStringsUnix(t *testing.T) {
+	t.Parallel()
+	tcp := RoutesFromStr("nats-route://127.0.0.1:6222")[0]
+	for _, tc := range []struct {
+		description string
+		in          []*url.URL
+		expected    []string
+	}{
+		// positive
+		{description: "tcp route keeps host:port", in: []*url.URL{tcp}, expected: []string{"127.0.0.1:6222"}},
+		{description: "unix pathname route", in: []*url.URL{unixRouteURL("/run/nats/b.sock")}, expected: []string{"unix:///run/nats/b.sock"}},
+		{description: "abstract unix route", in: []*url.URL{unixRouteURL("@nats-b")}, expected: []string{"unix://@nats-b"}},
+		{description: "mixed list keeps order", in: []*url.URL{tcp, unixRouteURL("/run/nats/b.sock")}, expected: []string{"127.0.0.1:6222", "unix:///run/nats/b.sock"}},
+		// boundary
+		{description: "empty list", in: nil, expected: []string{}},
+		// corner: a parsed unix URL (User/Host form) renders the same as the canonical one
+		{description: "parsed abstract url", in: []*url.URL{mustParseURL(t, "unix://@nats-b")}, expected: []string{"unix://@nats-b"}},
+	} {
+		t.Run(tc.description, func(t *testing.T) {
+			if got := urlsToStrings(tc.in); !reflect.DeepEqual(got, tc.expected) {
+				t.Fatalf("urlsToStrings = %q, expected %q", got, tc.expected)
+			}
 		})
 	}
 }

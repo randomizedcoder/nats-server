@@ -524,7 +524,7 @@ func TestClusterUnixFlags(t *testing.T) {
 }
 
 // TestRoutesFromStrUnix covers the error-returning route list parser used by
-// the -routes flag, and the exported wrapper's lenient behaviour.
+// the -routes flag, and the exported wrapper's lenient behavior.
 func TestRoutesFromStrUnix(t *testing.T) {
 	t.Parallel()
 	for _, tc := range []struct {

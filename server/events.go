@@ -392,11 +392,12 @@ type ServerStats struct {
 
 // RouteStat holds route statistics.
 type RouteStat struct {
-	ID       uint64    `json:"rid"`
-	Name     string    `json:"name,omitempty"`
-	Sent     DataStats `json:"sent"`
-	Received DataStats `json:"received"`
-	Pending  int       `json:"pending"`
+	ID        uint64    `json:"rid"`
+	Name      string    `json:"name,omitempty"`
+	Transport string    `json:"transport,omitempty"`
+	Sent      DataStats `json:"sent"`
+	Received  DataStats `json:"received"`
+	Pending   int       `json:"pending"`
 }
 
 // GatewayStat holds gateway statistics.
@@ -886,6 +887,7 @@ func routeStat(r *client) *RouteStat {
 	}
 	if r.route != nil {
 		rs.Name = r.route.remoteName
+		rs.Transport = r.route.transport
 	}
 	r.mu.Unlock()
 	return rs
