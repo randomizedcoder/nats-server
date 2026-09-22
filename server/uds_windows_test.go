@@ -57,6 +57,36 @@ func TestNativeUnixAddrWindows(t *testing.T) {
 	}
 }
 
+func TestURLUnixAddrWindows(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		description string
+		in          string
+		expected    string
+	}{
+		// positive
+		{description: "drive path gains leading slash and forward slashes", in: `C:\ProgramData\nats\a.sock`, expected: "/C:/ProgramData/nats/a.sock"},
+		{description: "lowercase drive", in: `c:\x\a.sock`, expected: "/c:/x/a.sock"},
+		{description: "abstract passes through", in: "@nats-a", expected: "@nats-a"},
+		// negative-ish: no drive letter
+		{description: "drive-less path only converts separators", in: `\run\a.sock`, expected: "/run/a.sock"},
+		{description: "digit before colon is not a drive", in: `1:\a.sock`, expected: "1:/a.sock"},
+		// boundary
+		{description: "bare drive", in: "C:", expected: "/C:"},
+		{description: "empty string", in: "", expected: ""},
+		// corner: round trip with nativeUnixAddr is the identity.
+		{description: "round trip drive path", in: nativeUnixAddr("/C:/nats/a.sock"), expected: "/C:/nats/a.sock"},
+		{description: "round trip drive-less path", in: nativeUnixAddr("/run/a.sock"), expected: "/run/a.sock"},
+		{description: "UNC path", in: `\\server\share\a.sock`, expected: "//server/share/a.sock"},
+	} {
+		t.Run(tc.description, func(t *testing.T) {
+			if got := urlUnixAddr(tc.in); got != tc.expected {
+				t.Fatalf("urlUnixAddr(%q) = %q, expected %q", tc.in, got, tc.expected)
+			}
+		})
+	}
+}
+
 func TestIsConnRefusedWindows(t *testing.T) {
 	t.Parallel()
 	for _, tc := range []struct {

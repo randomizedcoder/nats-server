@@ -15,9 +15,12 @@ package server
 
 import (
 	"fmt"
+	"net"
 	"net/url"
+	"os"
 	"strings"
 	"sync/atomic"
+	"time"
 )
 
 // Cluster routes over Unix domain sockets (UDS).
@@ -166,4 +169,54 @@ func unixAddrFromRouteURL(u *url.URL) (string, bool) {
 func isUnixRouteURL(u *url.URL) bool {
 	_, ok := unixAddrFromRouteURL(u)
 	return ok
+}
+
+// unixStaleProbeTimeout bounds the connect used to tell a stale socket file
+// (nothing listening, ECONNREFUSED) from one that is in use.
+const unixStaleProbeTimeout = 250 * time.Millisecond
+
+// listenRouteUnix binds the route listener to the unix domain socket at the
+// URL-form address addr produced by parseUnixAddr. For a pathname socket a
+// stale file left behind by a crashed server is removed first; anything that
+// is not a socket, or a socket another process is serving, is an error and
+// is never removed. The listener unlinks its own socket file on Close.
+func (s *Server) listenRouteUnix(addr string) (net.Listener, error) {
+	native := nativeUnixAddr(addr)
+	if !strings.HasPrefix(addr, "@") {
+		if err := s.removeStaleUnixSocket(native); err != nil {
+			return nil, err
+		}
+	}
+	return natsListen("unix", native)
+}
+
+// removeStaleUnixSocket removes the socket file at path when it exists and
+// nothing is accepting connections on it. It returns nil when there is
+// nothing at path, and an error, without touching the file, in every other
+// case that is not a stale socket.
+func (s *Server) removeStaleUnixSocket(path string) error {
+	fi, err := os.Lstat(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return fmt.Errorf("unable to stat %q: %w", path, err)
+	}
+	if fi.Mode()&os.ModeSocket == 0 {
+		return fmt.Errorf("%q exists and is not a socket", path)
+	}
+	conn, err := net.DialTimeout("unix", path, unixStaleProbeTimeout)
+	if err == nil {
+		conn.Close()
+		return fmt.Errorf("socket %q is in use by another process", path)
+	}
+	if !isConnRefused(err) {
+		return fmt.Errorf("unable to probe socket %q: %w", path, err)
+	}
+	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("unable to remove stale socket %q: %w", path, err)
+	}
+	s.Warnf("Removed stale unix socket %q", path)
+	s.udsStats.staleRemoved.Add(1)
+	return nil
 }

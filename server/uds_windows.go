@@ -46,6 +46,22 @@ func isDriveLetter(c byte) bool {
 	return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
 }
 
+// urlUnixAddr is the inverse of nativeUnixAddr: it returns the URL-form
+// address for a kernel-level address, such as the Name of a *net.UnixAddr.
+// Separators become "/" and a drive-letter path gains the leading "/" of
+// the file:// URI convention, so `C:\nats\a.sock` becomes "/C:/nats/a.sock".
+// Abstract addresses pass through unchanged.
+func urlUnixAddr(native string) string {
+	if strings.HasPrefix(native, "@") {
+		return native
+	}
+	addr := filepath.ToSlash(native)
+	if len(addr) >= 2 && isDriveLetter(addr[0]) && addr[1] == ':' {
+		addr = "/" + addr
+	}
+	return addr
+}
+
 // isConnRefused reports whether err is a connection-refused error from a
 // dial. Winsock reports WSAECONNREFUSED; syscall.ECONNREFUSED on Windows is
 // an invented errno that the network stack never returns.

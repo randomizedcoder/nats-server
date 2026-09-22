@@ -2749,16 +2749,32 @@ func (s *Server) startRouteAcceptLoop() {
 		s.Warnf("Cluster name was dynamically generated, consider setting one")
 	}
 
-	hp := net.JoinHostPort(opts.Cluster.Host, strconv.Itoa(port))
-	l, e := natsListen("tcp", hp)
-	s.routeListenerErr = e
-	if e != nil {
-		s.mu.Unlock()
-		s.Fatalf("Error listening on router port: %d - %v", opts.Cluster.Port, e)
-		return
+	var (
+		l net.Listener
+		e error
+	)
+	unixSocket := opts.Cluster.UnixSocket
+	if unixSocket != _EMPTY_ {
+		l, e = s.listenRouteUnix(unixSocket)
+		s.routeListenerErr = e
+		if e != nil {
+			s.mu.Unlock()
+			s.Fatalf("Error listening on router unix socket %s%s: %v", unixSchemePrefix, unixSocket, e)
+			return
+		}
+		s.Noticef("Listening for route connections on %s%s", unixSchemePrefix, unixSocket)
+	} else {
+		hp := net.JoinHostPort(opts.Cluster.Host, strconv.Itoa(port))
+		l, e = natsListen("tcp", hp)
+		s.routeListenerErr = e
+		if e != nil {
+			s.mu.Unlock()
+			s.Fatalf("Error listening on router port: %d - %v", opts.Cluster.Port, e)
+			return
+		}
+		s.Noticef("Listening for route connections on %s",
+			net.JoinHostPort(opts.Cluster.Host, strconv.Itoa(l.Addr().(*net.TCPAddr).Port)))
 	}
-	s.Noticef("Listening for route connections on %s",
-		net.JoinHostPort(opts.Cluster.Host, strconv.Itoa(l.Addr().(*net.TCPAddr).Port)))
 
 	// Check for TLSConfig
 	tlsReq := opts.Cluster.TLSConfig != nil
@@ -2796,9 +2812,9 @@ func (s *Server) startRouteAcceptLoop() {
 		info.WSConnectURLs = s.websocket.connectURLs
 	}
 	// If we have selected a random port...
-	if port == 0 {
+	if tcpAddr, ok := l.Addr().(*net.TCPAddr); ok && port == 0 {
 		// Write resolved port back to options.
-		opts.Cluster.Port = l.Addr().(*net.TCPAddr).Port
+		opts.Cluster.Port = tcpAddr.Port
 	}
 	// Check for Auth items
 	if opts.Cluster.Username != "" {
@@ -2833,7 +2849,16 @@ func (s *Server) startRouteAcceptLoop() {
 	}
 
 	// Now that we have the port, keep track of all ip:port that resolve to this server.
-	if interfaceAddr, err := net.InterfaceAddrs(); err == nil {
+	// A unix socket listener has no ip:port; record its own path (and the
+	// advertised path, if any) instead so that connectToRoute skips them.
+	if unixSocket != _EMPTY_ {
+		s.unixRoutesToSelf[unixSocket] = struct{}{}
+		if adv := opts.Cluster.Advertise; hasUnixScheme(adv) {
+			if advAddr, err := parseUnixAddr(adv); err == nil {
+				s.unixRoutesToSelf[advAddr] = struct{}{}
+			}
+		}
+	} else if interfaceAddr, err := net.InterfaceAddrs(); err == nil {
 		var localIPs []string
 		for i := 0; i < len(interfaceAddr); i++ {
 			interfaceIP, _, _ := net.ParseCIDR(interfaceAddr[i].String())
@@ -2850,7 +2875,12 @@ func (s *Server) startRouteAcceptLoop() {
 	}
 
 	// Start the accept loop in a different go routine.
-	go s.acceptConnections(l, "Route", func(conn net.Conn) { s.createRoute(conn, nil, Implicit, gossipDefault, _EMPTY_) }, nil)
+	go s.acceptConnections(l, "Route", func(conn net.Conn) {
+		if unixSocket != _EMPTY_ {
+			s.udsStats.accepted.Add(1)
+		}
+		s.createRoute(conn, nil, Implicit, gossipDefault, _EMPTY_)
+	}, nil)
 
 	// Solicit Routes if applicable. This will not block.
 	s.solicitRoutes(opts.Routes, opts.Cluster.PinnedAccounts)

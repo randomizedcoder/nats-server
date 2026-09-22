@@ -48,6 +48,29 @@ func TestNativeUnixAddr(t *testing.T) {
 	}
 }
 
+func TestURLUnixAddr(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		description string
+		in          string
+		expected    string
+	}{
+		// positive: on POSIX the native form is the URL form.
+		{description: "pathname unchanged", in: "/run/nats/a.sock", expected: "/run/nats/a.sock"},
+		{description: "abstract unchanged", in: "@nats-a", expected: "@nats-a"},
+		// boundary
+		{description: "empty string", in: "", expected: ""},
+		// corner: round trip with nativeUnixAddr is the identity.
+		{description: "round trip", in: nativeUnixAddr("/run/nats/a.sock"), expected: "/run/nats/a.sock"},
+	} {
+		t.Run(tc.description, func(t *testing.T) {
+			if got := urlUnixAddr(tc.in); got != tc.expected {
+				t.Fatalf("urlUnixAddr(%q) = %q, expected %q", tc.in, got, tc.expected)
+			}
+		})
+	}
+}
+
 func TestIsConnRefused(t *testing.T) {
 	t.Parallel()
 	for _, tc := range []struct {

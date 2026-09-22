@@ -784,9 +784,16 @@ func (c *client) initClient() {
 	if c.nc != nil {
 		if addr := c.nc.RemoteAddr(); addr != nil {
 			if conn = addr.String(); conn != _EMPTY_ {
-				host, port, _ := net.SplitHostPort(conn)
-				iPort, _ := strconv.ParseUint(port, 10, 16)
-				c.host, c.port = host, uint16(iPort)
+				if ua, ok := addr.(*net.UnixAddr); ok {
+					// A unix domain socket peer has a path (when it is
+					// the listener we dialed) and no port. Accepted
+					// peers are unnamed.
+					c.host, c.port = ua.Name, 0
+				} else {
+					host, port, _ := net.SplitHostPort(conn)
+					iPort, _ := strconv.ParseUint(port, 10, 16)
+					c.host, c.port = host, uint16(iPort)
+				}
 				if c.isWebsocket() && c.ws.clientIP != _EMPTY_ {
 					cip := c.ws.clientIP
 					// Surround IPv6 addresses with square brackets, as

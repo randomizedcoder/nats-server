@@ -27,6 +27,13 @@ func nativeUnixAddr(addr string) string {
 	return addr
 }
 
+// urlUnixAddr is the inverse of nativeUnixAddr: it returns the URL-form
+// address for a kernel-level address, such as the Name of a *net.UnixAddr.
+// On POSIX platforms the two forms are the same string.
+func urlUnixAddr(native string) string {
+	return native
+}
+
 // isConnRefused reports whether err is a connection-refused error from a
 // dial. It is used to tell a stale socket file apart from a live listener.
 func isConnRefused(err error) bool {

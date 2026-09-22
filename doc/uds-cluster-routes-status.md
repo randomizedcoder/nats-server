@@ -14,8 +14,8 @@ Last updated: 2026-09-22
 | 0 | GitHub issue | `[ ]` | Not opened yet. Write it by hand (CONTRIBUTING AI policy). |
 | 1 | Address parsing, canonical URL helpers, per-OS files | `[x]` | Committed on `uds-cluster-routes`. |
 | 2 | Options, flags, validation, reload rejection | `[x]` | Committed. |
-| 3 | Listener, stale socket, self-route map, accessors | `[~]` | |
-| 4 | Dial, gossip, INFO, TLS name fallback | `[ ]` | |
+| 3 | Listener, stale socket, self-route map, accessors | `[x]` | Committed. |
+| 4 | Dial, gossip, INFO, TLS name fallback | `[~]` | |
 | 5 | Monitoring fields and counters | `[ ]` | |
 | 6 | Multi-process configs, script, docs | `[ ]` | |
 | 7 | PR: draft, squash, sign-off, evidence | `[ ]` | |
@@ -87,23 +87,24 @@ Tests:
 
 ## Phase 3: listener (§4.3, §4.7)
 
-Files: `server/route.go`, `server/server.go`, `server/uds.go`
+Files: `server/route.go`, `server/server.go`, `server/client.go`, `server/uds.go`, `server/uds_unix.go`, `server/uds_windows.go`; tests in `server/routes_uds_test.go`
 
-- [ ] `listenRouteUnix` with stale-socket sequence (Lstat, not-a-socket error, probe dial, `ECONNREFUSED` remove)
-- [ ] `isConnRefused` per platform (`syscall.ECONNREFUSED`, `windows.WSAECONNREFUSED`)
-- [ ] `startRouteAcceptLoop` transport switch; both `(*net.TCPAddr)` assertions replaced by a type switch
-- [ ] Notice line for unix socket
-- [ ] `s.unixRoutesToSelf` populated with native listen path and advertise path
-- [ ] `ClusterAddr()` returns nil for UDS; add `ClusterUnixAddr()` and `ClusterListenAddr()`
-- [ ] `resolveHostPorts` / `formatURL` type switch; `PortsInfo` emits `unix:///...`
-- [ ] `client.go:785` sets `c.host` from `*net.UnixAddr`
-- [ ] Verified socket file is gone after `Shutdown` (Linux and Windows CI)
+- [x] `listenRouteUnix` with stale-socket sequence (Lstat, not-a-socket error, probe dial, `ECONNREFUSED` remove)
+- [x] `isConnRefused` per platform (`syscall.ECONNREFUSED`, `windows.WSAECONNREFUSED`)
+- [x] `startRouteAcceptLoop` transport switch; both `(*net.TCPAddr)` assertions replaced by a type switch
+- [x] Notice line for unix socket
+- [x] `s.unixRoutesToSelf` populated with the URL-form listen path and advertise path
+- [x] `ClusterAddr()` returns nil for UDS; add `ClusterUnixAddr()` and `ClusterListenAddr()`
+- [x] `resolveHostPorts` / `formatURL` type switch; `PortsInfo` emits `unix:///...`
+- [x] `client.go:785` sets `c.host` from `*net.UnixAddr`
+- [x] Verified socket file is gone after `Shutdown` (Linux locally; Windows pending CI)
 
 Tests:
 
-- [ ] §6.6 `TestListenRouteUnixStaleSocket`
-- [ ] §6.7 `TestServerUnixListenerAccessors`
-- [ ] `tempSocketPath(t)` and `skipIfNoUnixSockets(t)` helpers
+- [x] §6.6 `TestListenRouteUnixStaleSocket`
+- [x] §6.7 `TestServerUnixListenerAccessors`
+- [x] `tempSocketPath(t)`, `skipIfNoUnixSockets(t)`, `defaultUnixClusterOptions(t)`, `leaveStaleSocket(t)` helpers
+- [x] Extra: `TestListenRouteUnixPathLength` (real bind at `sun_path`-1 and one over), `TestServerUnixListenerStartupErrors` (`routeListenerErr` set, no listener), `TestFormatURLUnix` (fake listener table), `TestURLUnixAddr` per OS
 
 ## Phase 4: dial and gossip (§4.4, §4.6)
 
@@ -205,3 +206,4 @@ fails on this machine (`Expected Slow Consumer routes`, bandwidth-shaping proxy 
 | 2026-09-22 | Codebase survey; design doc written; this status file created. | Open issue (phase 0); start phase 1 helpers and §6.1 table. |
 | 2026-09-22 | Plan validated against code; design doc corrected (json tag, `setBaselineOptions` Host guard, 12 predicate sites, reject `%`, TLS error wording). Phase 1 helpers, per-OS files and tests written; `-race` green; windows vet, wasm/darwin/freebsd builds ok. Committed. | Phase 2: `UnixSocket` option, `listenEnabled()`, parse/validate/reload, predicate sites, tests. |
 | 2026-09-22 | Phase 2 done: `UnixSocket` field, `listenEnabled()` at all 12 sites, parse-time and `validateCluster` transport rules, `routesFromStr` error variant for `-routes`, `overrideCluster` unix branch, reload rejection. Fixed phase-1 length rule (pathname limit is `sun_path`-1, abstract is `sun_path`, matching Go's `SockaddrUnix`). Found the conf lexer accepts unquoted `unix:///...`. `-race` green on config/options/reload sets; `./test` route suite green. Committed. | Phase 3: `listenRouteUnix`, `startRouteAcceptLoop` transport switch, accessors, `unixRoutesToSelf`, real-socket tests. |
+| 2026-09-22 | Phase 3 done: `listenRouteUnix`/`removeStaleUnixSocket` (Lstat, not-a-socket, probe, `isConnRefused`, remove + warn + counter), accept loop transport switch, `udsStats` embedded, `unixRoutesToSelf`, `ClusterUnixAddr`/`ClusterListenAddr`, `formatURL` unix branch with `urlUnixAddr` inverse per OS, `initClient` host from `*net.UnixAddr`. Real-socket tables green under `-race`; route/client/ports regressions and `./test` suites green. Committed. | Phase 4: `setRouteInfoHostPortAndIP`, `connectToRoute` unix dial, `processRouteInfo`/`processImplicitRoute`/`hasThisRouteConfigured`, TLS name fallback, three-server mesh tests. |

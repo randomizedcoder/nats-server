@@ -174,6 +174,7 @@ type Server struct {
 	stats
 	scStats
 	staleStats
+	udsStats
 	mu                  sync.RWMutex
 	reloadMu            sync.RWMutex // Write-locked when a config reload is taking place ONLY
 	kp                  nkeys.KeyPair
@@ -225,6 +226,7 @@ type Server struct {
 	routeInfo           Info
 	routeResolver       netResolver
 	routesToSelf        map[string]struct{}
+	unixRoutesToSelf    map[string]struct{}
 	routeTLSName        string
 	leafNodeListener    net.Listener
 	leafNodeListenerErr error
@@ -780,6 +782,7 @@ func NewServer(opts *Options) (*Server, error) {
 		httpBasePath:       httpBasePath,
 		eventIds:           nuid.New(),
 		routesToSelf:       make(map[string]struct{}),
+		unixRoutesToSelf:   make(map[string]struct{}),
 		httpReqStats:       make(map[string]uint64), // Used to track HTTP requests
 		rateLimitLoggingCh: make(chan time.Duration, 1),
 		leafNodeEnabled:    opts.LeafNode.Port != 0 || len(opts.LeafNode.Remotes) > 0,
@@ -4001,13 +4004,40 @@ func (s *Server) MonitorAddr() *net.TCPAddr {
 }
 
 // ClusterAddr returns the net.Addr object for the route listener.
+// ClusterAddr returns the net.TCPAddr of the route listener, or nil when
+// there is no route listener or it is bound to a unix domain socket (see
+// ClusterUnixAddr and ClusterListenAddr).
 func (s *Server) ClusterAddr() *net.TCPAddr {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	if s.routeListener == nil {
 		return nil
 	}
-	return s.routeListener.Addr().(*net.TCPAddr)
+	addr, _ := s.routeListener.Addr().(*net.TCPAddr)
+	return addr
+}
+
+// ClusterUnixAddr returns the net.UnixAddr of the route listener, or nil
+// when there is no route listener or it is bound to a TCP address.
+func (s *Server) ClusterUnixAddr() *net.UnixAddr {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.routeListener == nil {
+		return nil
+	}
+	addr, _ := s.routeListener.Addr().(*net.UnixAddr)
+	return addr
+}
+
+// ClusterListenAddr returns the net.Addr of the route listener whatever
+// its transport, or nil when there is no route listener.
+func (s *Server) ClusterListenAddr() net.Addr {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.routeListener == nil {
+		return nil
+	}
+	return s.routeListener.Addr()
 }
 
 // ProfilerAddr returns the net.Addr object for the profiler listener.
@@ -4246,7 +4276,11 @@ func (s *Server) getNonLocalIPsIfHostIsIPAny(host string, all bool) (bool, []str
 // if the ip is not specified, attempt to resolve it
 func resolveHostPorts(addr net.Listener) []string {
 	hostPorts := make([]string, 0)
-	hp := addr.Addr().(*net.TCPAddr)
+	hp, ok := addr.Addr().(*net.TCPAddr)
+	if !ok {
+		// A unix domain socket has no host:port; see formatURL.
+		return hostPorts
+	}
 	port := strconv.Itoa(hp.Port)
 	if hp.IP.IsUnspecified() {
 		var ip net.IP
@@ -4272,8 +4306,14 @@ func resolveHostPorts(addr net.Listener) []string {
 	return hostPorts
 }
 
-// format the address of a net.Listener with a protocol
+// format the address of a net.Listener with a protocol. A listener bound to
+// a unix domain socket is formatted as "unix://<address>" regardless of the
+// protocol: TLS is negotiated on the connection and does not change how the
+// socket is reached.
 func formatURL(protocol string, addr net.Listener) []string {
+	if ua, ok := addr.Addr().(*net.UnixAddr); ok {
+		return []string{unixSchemePrefix + urlUnixAddr(ua.Name)}
+	}
 	hostports := resolveHostPorts(addr)
 	for i, hp := range hostports {
 		hostports[i] = fmt.Sprintf("%s://%s", protocol, hp)
