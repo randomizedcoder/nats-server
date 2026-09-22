@@ -88,10 +88,23 @@ type ClusterOpts struct {
 	WriteDeadline     time.Duration      `json:"-"`
 	WriteTimeout      WriteTimeoutPolicy `json:"-"`
 
+	// UnixSocket, when non-empty, makes the route listener bind a Unix
+	// domain socket instead of Host:Port. It holds the URL-form address
+	// after "unix://" ("/run/nats/a.sock", "@nats-a", or "/C:/nats/a.sock"
+	// on Windows). Host and Port must be zero when it is set.
+	UnixSocket string `json:"-"`
+
 	// Not exported (used in tests)
 	resolver netResolver
 	// Snapshot of configured TLS options.
 	tlsConfigOpts *TLSConfigOpts
+}
+
+// listenEnabled reports whether a route listener is configured, either on a
+// TCP host:port or on a Unix domain socket. Every "is clustering enabled"
+// decision goes through here rather than testing Port directly.
+func (c *ClusterOpts) listenEnabled() bool {
+	return c.Port != 0 || c.UnixSocket != _EMPTY_
 }
 
 // CompressionOpts defines the compression mode and optional configuration.
@@ -2028,6 +2041,10 @@ func parseCluster(v any, opts *Options, errors *[]error, warnings *[]error) erro
 		return &configErr{tk, fmt.Sprintf("Expected map to define cluster, got %T", v)}
 	}
 
+	// Tokens remembered for the cross-field checks after the loop. Map
+	// iteration order is random, so they cannot be done inline.
+	var listenTk, advertiseTk token
+
 	for mk, mv := range cm {
 		// Again, unwrap token value if line check is required.
 		tk, mv = unwrapValue(mv, &lt)
@@ -2046,6 +2063,20 @@ func parseCluster(v any, opts *Options, errors *[]error, warnings *[]error) erro
 			}
 			opts.Cluster.Name = cn
 		case "listen":
+			listenTk = tk
+			if ls, ok := mv.(string); ok && hasUnixScheme(ls) {
+				addr, err := parseUnixAddr(ls)
+				if err != nil {
+					*errors = append(*errors, &configErr{tk, err.Error()})
+					continue
+				}
+				opts.Cluster.UnixSocket = addr
+				if runtime.GOOS != "linux" && strings.HasPrefix(addr, "@") {
+					*warnings = append(*warnings, &configErr{tk,
+						"abstract unix socket names are only supported on Linux"})
+				}
+				continue
+			}
 			hp, err := parseListen(mv)
 			if err != nil {
 				err := &configErr{tk, err.Error()}
@@ -2124,6 +2155,7 @@ func parseCluster(v any, opts *Options, errors *[]error, warnings *[]error) erro
 			opts.Cluster.TLSCheckKnownURLs = tlsopts.TLSCheckKnownURLs
 			opts.Cluster.tlsConfigOpts = tlsopts
 		case "cluster_advertise", "advertise":
+			advertiseTk = tk
 			opts.Cluster.Advertise = mv.(string)
 		case "no_advertise":
 			opts.Cluster.NoAdvertise = mv.(bool)
@@ -2182,6 +2214,43 @@ func parseCluster(v any, opts *Options, errors *[]error, warnings *[]error) erro
 				continue
 			}
 		}
+	}
+	// Cross-field checks. These are repeated in validateCluster for
+	// embedded users, but they must also run here so that --config-check
+	// reports them: ConfigureOptions returns before validateOptions runs.
+	if err := checkClusterListenTransport(&opts.Cluster, listenTk, advertiseTk); err != nil {
+		*errors = append(*errors, err)
+	}
+	return nil
+}
+
+// checkClusterListenTransport applies the parse-time rules that relate the
+// route listener transport to the other cluster fields:
+//   - a unix socket listen is mutually exclusive with host/port;
+//   - an advertise address must use the same transport as the listener and,
+//     when it is a unix:// URL, must be a valid unix socket address.
+//
+// The transport check only fires when the listener transport is known from
+// the file itself. A file with just "advertise" whose listener comes from
+// the -cluster flag is validated later by validateCluster.
+func checkClusterListenTransport(c *ClusterOpts, listenTk, advertiseTk token) error {
+	unixListener := c.UnixSocket != _EMPTY_
+	tcpListener := c.Host != _EMPTY_ || c.Port != 0
+	if unixListener && tcpListener {
+		return &configErr{listenTk, "unix socket listen and host/port are mutually exclusive"}
+	}
+	if c.Advertise == _EMPTY_ {
+		return nil
+	}
+	if hasUnixScheme(c.Advertise) {
+		if _, err := parseUnixAddr(c.Advertise); err != nil {
+			return &configErr{advertiseTk, err.Error()}
+		}
+		if tcpListener {
+			return &configErr{advertiseTk, `advertise transport "unix" does not match listener transport "tcp"`}
+		}
+	} else if unixListener {
+		return &configErr{advertiseTk, `advertise transport "tcp" does not match listener transport "unix"`}
 	}
 	return nil
 }
@@ -2265,6 +2334,15 @@ func parseURLs(a []any, typ string, warnings *[]error) (urls []*url.URL, errors 
 
 func parseURL(u string, typ string) (*url.URL, error) {
 	urlStr := strings.TrimSpace(u)
+	// Routes may be unix socket addresses; store them in the canonical
+	// form so that URL comparisons in reload and gossip are by value.
+	if typ == "route" && hasUnixScheme(urlStr) {
+		addr, err := parseUnixAddr(urlStr)
+		if err != nil {
+			return nil, fmt.Errorf("error parsing %s url [%q]: %v", typ, urlStr, err)
+		}
+		return unixRouteURL(addr), nil
+	}
 	url, err := url.Parse(urlStr)
 	if err != nil {
 		// Security note: if it's not well-formed but still reached us, then we're going to log as-is which might include password information here.
@@ -5984,19 +6062,31 @@ func MergeOptions(fileOpts, flagOpts *Options) *Options {
 	return &opts
 }
 
-// RoutesFromStr parses route URLs from a string
+// RoutesFromStr parses route URLs from a string. Malformed entries are
+// dropped; use routesFromStr to have them reported.
 func RoutesFromStr(routesStr string) []*url.URL {
+	routeUrls, _ := routesFromStr(routesStr)
+	return routeUrls
+}
+
+// routesFromStr parses a comma separated list of route URLs, accepting
+// nats-route://host:port and unix:// forms, and returns the first parse
+// error together with the URLs that parsed before it.
+func routesFromStr(routesStr string) ([]*url.URL, error) {
 	routes := strings.Split(routesStr, ",")
-	if len(routes) == 0 {
-		return nil
-	}
-	routeUrls := []*url.URL{}
+	routeUrls := make([]*url.URL, 0, len(routes))
+	var firstErr error
 	for _, r := range routes {
-		r = strings.TrimSpace(r)
-		u, _ := url.Parse(r)
+		u, err := parseURL(r, "route")
+		if err != nil {
+			if firstErr == nil {
+				firstErr = err
+			}
+			continue
+		}
 		routeUrls = append(routeUrls, u)
 	}
-	return routeUrls
+	return routeUrls, firstErr
 }
 
 // This will merge the flag routes and override anything that was present.
@@ -6039,8 +6129,9 @@ func setBaselineOptions(opts *Options) {
 	if opts.AuthTimeout == 0 {
 		opts.AuthTimeout = getDefaultAuthTimeout(opts.TLSConfig, opts.TLSTimeout)
 	}
-	if opts.Cluster.Port != 0 || opts.Cluster.ListenStr != _EMPTY_ {
-		if opts.Cluster.Host == _EMPTY_ {
+	if opts.Cluster.listenEnabled() || opts.Cluster.ListenStr != _EMPTY_ {
+		// A unix socket listener has no host to default.
+		if opts.Cluster.Host == _EMPTY_ && opts.Cluster.UnixSocket == _EMPTY_ {
 			opts.Cluster.Host = DEFAULT_HOST
 		}
 		if opts.Cluster.TLSTimeout == 0 {
@@ -6454,7 +6545,11 @@ func ConfigureOptions(fs *flag.FlagSet, args []string, printVersion, printHelp, 
 					opts.Routes = nil
 					return
 				}
-				routeUrls := RoutesFromStr(opts.RoutesStr)
+				routeUrls, err := routesFromStr(opts.RoutesStr)
+				if err != nil {
+					flagErr = err
+					return
+				}
 				opts.Routes = routeUrls
 			}
 		}
@@ -6474,7 +6569,7 @@ func ConfigureOptions(fs *flag.FlagSet, args []string, printVersion, printHelp, 
 	// If we don't have cluster defined in the configuration
 	// file and no cluster listen string override, but we do
 	// have a routes override, we need to report misconfiguration.
-	if opts.RoutesStr != _EMPTY_ && opts.Cluster.ListenStr == _EMPTY_ && opts.Cluster.Host == _EMPTY_ && opts.Cluster.Port == 0 {
+	if opts.RoutesStr != _EMPTY_ && opts.Cluster.ListenStr == _EMPTY_ && opts.Cluster.Host == _EMPTY_ && !opts.Cluster.listenEnabled() {
 		return nil, errors.New("solicited routes require cluster capabilities, e.g. --cluster")
 	}
 
@@ -6520,8 +6615,26 @@ func overrideCluster(opts *Options) error {
 	if opts.Cluster.ListenStr == _EMPTY_ {
 		// This one is enough to disable clustering.
 		opts.Cluster.Port = 0
+		opts.Cluster.UnixSocket = _EMPTY_
 		return nil
 	}
+	// A unix socket listen string replaces any host/port (and credentials,
+	// which unix:// URLs cannot carry) from the configuration file. It is
+	// checked before the ":-1" rewrite below, which is TCP-only syntax.
+	if hasUnixScheme(opts.Cluster.ListenStr) {
+		addr, err := parseUnixAddr(opts.Cluster.ListenStr)
+		if err != nil {
+			return err
+		}
+		opts.Cluster.UnixSocket = addr
+		opts.Cluster.Host = _EMPTY_
+		opts.Cluster.Port = 0
+		opts.Cluster.Username = _EMPTY_
+		opts.Cluster.Password = _EMPTY_
+		return nil
+	}
+	// A TCP listen string overrides a unix socket from the file.
+	opts.Cluster.UnixSocket = _EMPTY_
 	// -1 will fail url.Parse, so if we have -1, change it to
 	// 0, and then after parse, replace the port with -1 so we get
 	// automatic port allocation

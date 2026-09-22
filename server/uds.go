@@ -97,11 +97,18 @@ func parseUnixAddr(raw string) (string, error) {
 	}
 	// The address must fit sun_path. Measure the native form net.Dial
 	// receives: on Windows a drive-letter URL path carries an extra leading
-	// "/" that nativeUnixAddr strips before dialing. For an abstract socket
-	// the "@" occupies the byte the kernel uses for the leading NUL.
-	if n := len(nativeUnixAddr(addr)); n > maxUnixSocketPathLen {
+	// "/" that nativeUnixAddr strips before dialing. A pathname must leave
+	// one byte for the terminating NUL, which is what Go's SockaddrUnix
+	// enforces on every OS. For an abstract socket the "@" occupies the
+	// byte the kernel uses for the leading NUL, so the name may fill
+	// sun_path completely.
+	limit := maxUnixSocketPathLen
+	if !strings.HasPrefix(addr, "@") {
+		limit--
+	}
+	if n := len(nativeUnixAddr(addr)); n > limit {
 		return _EMPTY_, fmt.Errorf("unix socket address %q is too long: %d bytes, max is %d",
-			raw, n, maxUnixSocketPathLen)
+			raw, n, limit)
 	}
 	if strings.HasPrefix(addr, "@") {
 		if addr == "@" {

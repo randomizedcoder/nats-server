@@ -2971,7 +2971,7 @@ func validateJetStreamOptions(o *Options) error {
 		}
 	}
 	// If not clustered no checks needed past here.
-	if !o.JetStream || o.Cluster.Port == 0 {
+	if !o.JetStream || !o.Cluster.listenEnabled() {
 		return nil
 	}
 	if o.ServerName == _EMPTY_ {

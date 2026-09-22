@@ -13,8 +13,8 @@ Last updated: 2026-09-22
 |---|---|---|---|
 | 0 | GitHub issue | `[ ]` | Not opened yet. Write it by hand (CONTRIBUTING AI policy). |
 | 1 | Address parsing, canonical URL helpers, per-OS files | `[x]` | Committed on `uds-cluster-routes`. |
-| 2 | Options, flags, validation, reload rejection | `[~]` | |
-| 3 | Listener, stale socket, self-route map, accessors | `[ ]` | |
+| 2 | Options, flags, validation, reload rejection | `[x]` | Committed. |
+| 3 | Listener, stale socket, self-route map, accessors | `[~]` | |
 | 4 | Dial, gossip, INFO, TLS name fallback | `[ ]` | |
 | 5 | Monitoring fields and counters | `[ ]` | |
 | 6 | Multi-process configs, script, docs | `[ ]` | |
@@ -49,40 +49,41 @@ Tests:
 
 ## Phase 2: options and validation (§3.2, §4.5)
 
-Files: `server/opts.go`, `server/server.go`, `server/reload.go`
+Files: `server/opts.go`, `server/server.go`, `server/reload.go`, `server/events.go`, `server/jetstream.go`, `server/mqtt.go`; tests in `server/opts_uds_test.go` and `server/config_check_test.go`
 
-- [ ] `ClusterOpts.UnixSocket` field with doc comment and `json:"-"` (ClusterOpts json tags are deprecated)
-- [ ] `(*ClusterOpts).listenEnabled()` helper
-- [ ] Replace `Cluster.Port != 0` / `== 0` at all twelve sites (list in §2; tick each below)
-  - [ ] `server.go:815` leafnode remotes check
-  - [ ] `server.go:881` dynamic cluster name
-  - [ ] `server.go:1135` validateCluster leaf check
-  - [ ] `server.go:1578` standAloneMode
-  - [ ] `server.go:1952` shouldTrackSubscriptions
-  - [ ] `server.go:2556` StartRouting launch
-  - [ ] `server.go:4008` healthz route check
-  - [ ] `server.go:4413` serviceListeners
-  - [ ] `events.go:914` system events gate
-  - [ ] `jetstream.go:2974` clustered JetStream gate
-  - [ ] `mqtt.go:721` and `mqtt.go:750` MQTT cluster checks
-  - [ ] `opts.go:6042` cluster defaults gate
-  - [ ] `opts.go:6477` "solicited routes require cluster capabilities"
-- [ ] `parseCluster` `listen` accepts `unix://` string before `parseListen`
-- [ ] `parseURL` canonicalises `unix://` for `typ == "route"`
-- [ ] `RoutesFromStr` error-returning sibling used by flag processing; exported signature unchanged
-- [ ] `overrideCluster` handles `-cluster unix://...` and skips the `:-1` rewrite for it
-- [ ] `advertise` accepts `unix://`; transport must match listener
-- [ ] `validateCluster`: mutual exclusion with host/port, advertise transport match, non-Linux abstract warning
-- [ ] `validateClusterOpts` (reload): `UnixSocket` non-reloadable; `Advertise` validated with `parseUnixAddr` when `unix://`
-- [ ] `setBaselineOptions` only defaults `Cluster.Host` when `UnixSocket` is empty
+- [x] `ClusterOpts.UnixSocket` field with doc comment and `json:"-"` (ClusterOpts json tags are deprecated)
+- [x] `(*ClusterOpts).listenEnabled()` helper
+- [x] Replace `Cluster.Port != 0` / `== 0` at all twelve sites (list in §2; tick each below)
+  - [x] `server.go:815` leafnode remotes check
+  - [x] `server.go:881` dynamic cluster name
+  - [x] `server.go:1135` validateCluster leaf check
+  - [x] `server.go:1578` standAloneMode
+  - [x] `server.go:1952` shouldTrackSubscriptions
+  - [x] `server.go:2556` StartRouting launch
+  - [x] `server.go:4008` healthz route check
+  - [x] `server.go:4413` serviceListeners
+  - [x] `events.go:914` system events gate
+  - [x] `jetstream.go:2974` clustered JetStream gate
+  - [x] `mqtt.go:721` and `mqtt.go:750` MQTT cluster checks
+  - [x] `opts.go:6042` cluster defaults gate
+  - [x] `opts.go:6477` "solicited routes require cluster capabilities"
+- [x] `parseCluster` `listen` accepts `unix://` string before `parseListen`
+- [x] `parseURL` canonicalises `unix://` for `typ == "route"`
+- [x] `RoutesFromStr` error-returning sibling used by flag processing; exported signature unchanged
+- [x] `overrideCluster` handles `-cluster unix://...` and skips the `:-1` rewrite for it
+- [x] `advertise` accepts `unix://`; transport must match listener
+- [x] `validateCluster`: mutual exclusion with host/port, advertise transport match, non-Linux abstract warning
+- [x] `validateClusterOpts` (reload): `UnixSocket` non-reloadable; `Advertise` validated with `parseUnixAddr` when `unix://`
+- [x] `setBaselineOptions` only defaults `Cluster.Host` when `UnixSocket` is empty
 
 Tests:
 
-- [ ] §6.4 `TestClusterOptsUnixSocketConfig`
-- [ ] `TestConfigCheck` rows with exact `errorLine`/`errorPos`
-- [ ] §6.5 `TestClusterUnixFlags`
-- [ ] §6.11 `TestRouteUnixReload` (rejection rows only; add/remove rows land in phase 4)
-- [ ] `nats-server --config-check` on the §7.2 configs passes
+- [x] §6.4 `TestClusterOptsUnixSocketConfig`
+- [x] `TestConfigCheck` rows with exact `errorLine`/`errorPos`
+- [x] §6.5 `TestClusterUnixFlags`
+- [x] §6.11 rejection rows as `TestValidateClusterOptsUnixSocket` (unit table over `validateClusterOpts`); live add/remove rows land in phase 4 as `TestRouteUnixReload`
+- [x] `nats-server -t -c` on a UDS config passes and rejects `listen: unix` + `port` with line:col
+- [x] Extra tables: `TestRoutesFromStrUnix`, `TestClusterListenEnabled`, `TestSetBaselineOptionsUnixSocket`, `TestValidateClusterUnixSocket`, `TestClusterPortPredicateSites` (greps non-test `server/*.go`)
 
 ## Phase 3: listener (§4.3, §4.7)
 
@@ -185,7 +186,17 @@ Record decisions here with the date so they are not re-litigated.
 
 Paste command output that will go into the PR description here as it is produced.
 
-_(empty)_
+Phase 2 (2026-09-22), `nats-server -t`:
+
+```
+$ nats-server -t -c uds-a.conf
+nats-server: configuration file uds-a.conf is valid (sha256:dd74e37f...)
+$ nats-server -t -c uds-bad.conf     # listen: "unix:///tmp/nats-uds/a.sock" + port: 6222
+nats-server: uds-bad.conf:2:3: unix socket listen and host/port are mutually exclusive
+```
+
+Pre-existing on `main` (`edb1b17a`), not caused by this branch: `TestRouteSlowConsumerRecover`
+fails on this machine (`Expected Slow Consumer routes`, bandwidth-shaping proxy timing).
 
 ## Session log
 
@@ -193,3 +204,4 @@ _(empty)_
 |---|---|---|
 | 2026-09-22 | Codebase survey; design doc written; this status file created. | Open issue (phase 0); start phase 1 helpers and §6.1 table. |
 | 2026-09-22 | Plan validated against code; design doc corrected (json tag, `setBaselineOptions` Host guard, 12 predicate sites, reject `%`, TLS error wording). Phase 1 helpers, per-OS files and tests written; `-race` green; windows vet, wasm/darwin/freebsd builds ok. Committed. | Phase 2: `UnixSocket` option, `listenEnabled()`, parse/validate/reload, predicate sites, tests. |
+| 2026-09-22 | Phase 2 done: `UnixSocket` field, `listenEnabled()` at all 12 sites, parse-time and `validateCluster` transport rules, `routesFromStr` error variant for `-routes`, `overrideCluster` unix branch, reload rejection. Fixed phase-1 length rule (pathname limit is `sun_path`-1, abstract is `sun_path`, matching Go's `SockaddrUnix`). Found the conf lexer accepts unquoted `unix:///...`. `-race` green on config/options/reload sets; `./test` route suite green. Committed. | Phase 3: `listenRouteUnix`, `startRouteAcceptLoop` transport switch, accessors, `unixRoutesToSelf`, real-socket tests. |

@@ -56,7 +56,10 @@ func TestHasUnixScheme(t *testing.T) {
 
 func TestParseUnixAddr(t *testing.T) {
 	t.Parallel()
-	maxPath := "/" + strings.Repeat("a", maxUnixSocketPathLen-1)
+	// A pathname leaves one byte of sun_path for the NUL terminator; an
+	// abstract name may use all of it because "@" stands in for the leading
+	// NUL. Both limits are what Go's SockaddrUnix enforces.
+	maxPath := "/" + strings.Repeat("a", maxUnixSocketPathLen-2)
 	maxAbstract := "@" + strings.Repeat("a", maxUnixSocketPathLen-1)
 
 	type row struct {
@@ -100,7 +103,7 @@ func TestParseUnixAddr(t *testing.T) {
 		{description: "malformed percent escape", in: "unix:///%ZZ", expectedErr: "unable to parse"},
 		{description: "NUL byte in path", in: "unix:///run/a\x00.sock", expectedErr: "unable to parse"},
 		// boundary
-		{description: "path exactly at limit", in: "unix://" + maxPath, expected: maxPath},
+		{description: "path exactly at limit (sun_path minus the NUL)", in: "unix://" + maxPath, expected: maxPath},
 		{description: "path one byte over limit", in: "unix://" + maxPath + "a", expectedErr: "too long"},
 		{description: "abstract name at limit, @ counts as the NUL byte", in: "unix://" + maxAbstract, expected: maxAbstract},
 		{description: "abstract name one byte over limit", in: "unix://" + maxAbstract + "a", expectedErr: "too long"},
@@ -114,8 +117,8 @@ func TestParseUnixAddr(t *testing.T) {
 	}
 	// The kernel limit applies to the native form. On Windows a drive-letter
 	// URL path is one byte longer than the native path ("/C:/..." -> "C:\..."),
-	// so a URL form one byte over the limit is still accepted there.
-	winDrive := "/C:/" + strings.Repeat("a", maxUnixSocketPathLen-3) // len == max+1
+	// so a URL form one byte over the pathname limit is still accepted there.
+	winDrive := "/C:/" + strings.Repeat("a", maxUnixSocketPathLen-4) // len == pathname limit + 1
 	if runtime.GOOS == "windows" {
 		rows = append(rows, row{description: "windows drive form one over URL limit fits natively", in: "unix://" + winDrive, expected: winDrive})
 		rows = append(rows, row{description: "windows drive form two over URL limit is too long", in: "unix://" + winDrive + "a", expectedErr: "too long"})

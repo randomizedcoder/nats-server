@@ -1252,6 +1252,128 @@ func TestConfigCheck(t *testing.T) {
 			errorPos:  22,
 		},
 		{
+			name: "when cluster listen is a unix socket",
+			config: `
+		cluster {
+		  listen = "unix:///run/nats/a.sock"
+		}
+		`,
+			err: nil,
+		},
+		{
+			name: "when cluster listen is a unix socket and a port is also set",
+			config: `
+		cluster {
+		  listen = "unix:///run/nats/a.sock"
+		  port = 6222
+		}
+		`,
+			err:       errors.New(`unix socket listen and host/port are mutually exclusive`),
+			errorLine: 3,
+			errorPos:  5,
+		},
+		{
+			name: "when cluster listen is a unix socket and a host is also set",
+			config: `
+		cluster {
+		  host = "127.0.0.1"
+		  listen = "unix:///run/nats/a.sock"
+		}
+		`,
+			err:       errors.New(`unix socket listen and host/port are mutually exclusive`),
+			errorLine: 4,
+			errorPos:  5,
+		},
+		{
+			name: "when cluster listen is a relative unix socket path",
+			config: `
+		cluster {
+		  listen = "unix://run/nats/a.sock"
+		}
+		`,
+			err:       errors.New(`unix socket address "unix://run/nats/a.sock" must be an absolute path like "unix:///run/nats/route.sock" (note the three slashes)`),
+			errorLine: 3,
+			errorPos:  5,
+		},
+		{
+			name: "when cluster listen is a unix socket directory",
+			config: `
+		cluster {
+		  listen = "unix:///run/nats/"
+		}
+		`,
+			err:       errors.New(`unix socket address "unix:///run/nats/" ends with "/"; it must point to a socket file, not a directory`),
+			errorLine: 3,
+			errorPos:  5,
+		},
+		{
+			name: "when cluster advertise is a unix socket but listen is tcp",
+			config: `
+		cluster {
+		  listen = "127.0.0.1:6222"
+		  advertise = "unix:///run/nats/a.sock"
+		}
+		`,
+			err:       errors.New(`advertise transport "unix" does not match listener transport "tcp"`),
+			errorLine: 4,
+			errorPos:  5,
+		},
+		{
+			name: "when cluster advertise is tcp but listen is a unix socket",
+			config: `
+		cluster {
+		  listen = "unix:///run/nats/a.sock"
+		  advertise = "10.0.0.1:6222"
+		}
+		`,
+			err:       errors.New(`advertise transport "tcp" does not match listener transport "unix"`),
+			errorLine: 4,
+			errorPos:  5,
+		},
+		{
+			name: "when cluster advertise is an invalid unix socket",
+			config: `
+		cluster {
+		  listen = "unix:///run/nats/a.sock"
+		  advertise = "unix:///run/nats/a.sock?x=1"
+		}
+		`,
+			err:       errors.New(`unix socket address "unix:///run/nats/a.sock?x=1" must not contain a "?" query`),
+			errorLine: 4,
+			errorPos:  5,
+		},
+		{
+			name: "when cluster routes include an invalid unix socket",
+			config: `
+		cluster {
+		  listen = "unix:///run/nats/a.sock"
+                  routes = [
+                    "unix:///run/nats/b.sock"
+                    "unix://run/nats/c.sock"
+                  ]
+		}
+		`,
+			err:       errors.New(`error parsing route url ["unix://run/nats/c.sock"]: unix socket address "unix://run/nats/c.sock" must be an absolute path like "unix:///run/nats/route.sock" (note the three slashes)`),
+			errorLine: 6,
+			errorPos:  22,
+		},
+		{
+			name: "when cluster routes include a duplicate unix socket",
+			config: `
+		cluster {
+		  listen = "unix:///run/nats/a.sock"
+                  routes = [
+                    "unix:///run/nats/b.sock"
+                    "unix:///run/nats/b.sock"
+                  ]
+		}
+		`,
+			warningErr: errors.New(`invalid use of field "unix:///run/nats/b.sock"`),
+			errorLine:  6,
+			errorPos:   22,
+			reason:     `Duplicate route entry detected`,
+		},
+		{
 			name: "when setting invalid TLS config within cluster block",
 			config: `
 		cluster {

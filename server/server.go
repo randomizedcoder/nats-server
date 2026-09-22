@@ -812,7 +812,7 @@ func NewServer(opts *Options) (*Server, error) {
 
 	// If we have solicited leafnodes but no clustering and no clustername.
 	// However we may need a stable clustername so use the server name.
-	if len(opts.LeafNode.Remotes) > 0 && opts.Cluster.Port == 0 && opts.Cluster.Name == _EMPTY_ {
+	if len(opts.LeafNode.Remotes) > 0 && !opts.Cluster.listenEnabled() && opts.Cluster.Name == _EMPTY_ {
 		s.leafNoCluster = true
 		opts.Cluster.Name = opts.ServerName
 	}
@@ -878,7 +878,7 @@ func NewServer(opts *Options) (*Server, error) {
 	}
 
 	// If we have a cluster definition but do not have a cluster name, create one.
-	if opts.Cluster.Port != 0 && opts.Cluster.Name == _EMPTY_ {
+	if opts.Cluster.listenEnabled() && opts.Cluster.Name == _EMPTY_ {
 		s.info.Cluster = nuid.Next()
 	} else if opts.Cluster.Name != _EMPTY_ {
 		// Likewise here if we have a cluster name set.
@@ -1104,6 +1104,32 @@ func (s *Server) WebsocketURL() string {
 	return u.String()
 }
 
+// validateClusterListenTransport checks that a unix socket route listener is
+// not combined with a host/port, and that "advertise" uses the listener's
+// transport and, for unix://, is a valid unix socket address. It mirrors the
+// parse-time checkClusterListenTransport for options built in code and for
+// listeners supplied through the -cluster flag.
+func validateClusterListenTransport(c *ClusterOpts) error {
+	unixListener := c.UnixSocket != _EMPTY_
+	if unixListener && (c.Host != _EMPTY_ || c.Port != 0) {
+		return errors.New("unix socket listen and host/port are mutually exclusive")
+	}
+	if c.Advertise == _EMPTY_ || !c.listenEnabled() {
+		return nil
+	}
+	if hasUnixScheme(c.Advertise) {
+		if _, err := parseUnixAddr(c.Advertise); err != nil {
+			return fmt.Errorf("invalid advertise: %v", err)
+		}
+		if !unixListener {
+			return errors.New(`advertise transport "unix" does not match listener transport "tcp"`)
+		}
+	} else if unixListener {
+		return errors.New(`advertise transport "tcp" does not match listener transport "unix"`)
+	}
+	return nil
+}
+
 func validateCluster(o *Options) error {
 	if o.Cluster.Name != _EMPTY_ && strings.Contains(o.Cluster.Name, " ") {
 		return ErrClusterNameHasSpaces
@@ -1122,6 +1148,9 @@ func validateCluster(o *Options) error {
 	if err := validatePinnedCerts(o.Cluster.TLSPinnedCerts); err != nil {
 		return fmt.Errorf("cluster: %v", err)
 	}
+	if err := validateClusterListenTransport(&o.Cluster); err != nil {
+		return fmt.Errorf("cluster: %v", err)
+	}
 	// Check that cluster name if defined matches any gateway name.
 	// Note that we have already verified that the gateway name does not have spaces.
 	if o.Gateway.Name != _EMPTY_ && o.Gateway.Name != o.Cluster.Name {
@@ -1132,7 +1161,7 @@ func validateCluster(o *Options) error {
 		o.Cluster.Name = o.Gateway.Name
 	}
 	clusterName := o.Cluster.Name
-	if clusterName == _EMPTY_ && len(o.LeafNode.Remotes) > 0 && o.Cluster.Port == 0 {
+	if clusterName == _EMPTY_ && len(o.LeafNode.Remotes) > 0 && !o.Cluster.listenEnabled() {
 		clusterName = o.ServerName
 	}
 	if clusterName == leafNoOriginCluster {
@@ -1575,7 +1604,7 @@ func (s *Server) globalAccountOnly() bool {
 // Determines if this server is in standalone mode, meaning no routes or gateways.
 func (s *Server) standAloneMode() bool {
 	opts := s.getOpts()
-	return opts.Cluster.Port == 0 && opts.Gateway.Port == 0
+	return !opts.Cluster.listenEnabled() && opts.Gateway.Port == 0
 }
 
 func (s *Server) configuredRoutes() int {
@@ -1949,7 +1978,7 @@ func (s *Server) createInternalClient(kind int) *client {
 // Lock should be held on entry.
 func (s *Server) shouldTrackSubscriptions() bool {
 	opts := s.getOpts()
-	return (opts.Cluster.Port != 0 || opts.Gateway.Port != 0)
+	return (opts.Cluster.listenEnabled() || opts.Gateway.Port != 0)
 }
 
 // Invokes registerAccountNoLock under the protection of the server lock.
@@ -2553,7 +2582,7 @@ func (s *Server) Start() {
 	}
 
 	// Start up routing as well if needed.
-	if opts.Cluster.Port != 0 {
+	if opts.Cluster.listenEnabled() {
 		s.startGoRoutine(func() {
 			s.StartRouting(clientListenReady)
 		})
@@ -4005,7 +4034,7 @@ func (s *Server) readyForConnections(d time.Duration) error {
 	for time.Now().Before(end) {
 		s.mu.RLock()
 		chk["server"] = info{ok: s.listener != nil || opts.DontListen, err: s.listenerErr}
-		chk["route"] = info{ok: (opts.Cluster.Port == 0 || s.routeListener != nil), err: s.routeListenerErr}
+		chk["route"] = info{ok: (!opts.Cluster.listenEnabled() || s.routeListener != nil), err: s.routeListenerErr}
 		chk["gateway"] = info{ok: (opts.Gateway.Name == _EMPTY_ || s.gatewayListener != nil), err: s.gatewayListenerErr}
 		chk["leafnode"] = info{ok: (opts.LeafNode.Port == 0 || s.leafNodeListener != nil), err: s.leafNodeListenerErr}
 		chk["websocket"] = info{ok: (opts.Websocket.Port == 0 || s.websocket.listener != nil), err: s.websocket.listenerErr}
@@ -4410,7 +4439,7 @@ func (s *Server) serviceListeners() []net.Listener {
 	listeners := make([]net.Listener, 0)
 	opts := s.getOpts()
 	listeners = append(listeners, s.listener)
-	if opts.Cluster.Port != 0 {
+	if opts.Cluster.listenEnabled() {
 		listeners = append(listeners, s.routeListener)
 	}
 	if opts.HTTPPort != 0 || opts.HTTPSPort != 0 {

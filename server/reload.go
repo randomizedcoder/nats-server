@@ -2802,6 +2802,10 @@ func (s *Server) reloadClusterPoolAndAccounts(co *clusterOption, opts *Options) 
 // validateClusterOpts ensures the new ClusterOpts does not change some of the
 // fields that do not support reload.
 func validateClusterOpts(old, new ClusterOpts) error {
+	if old.UnixSocket != new.UnixSocket {
+		return fmt.Errorf("config reload not supported for cluster unix socket: old=%q, new=%q",
+			old.UnixSocket, new.UnixSocket)
+	}
 	if old.Host != new.Host {
 		return fmt.Errorf("config reload not supported for cluster host: old=%s, new=%s",
 			old.Host, new.Host)
@@ -2810,10 +2814,15 @@ func validateClusterOpts(old, new ClusterOpts) error {
 		return fmt.Errorf("config reload not supported for cluster port: old=%d, new=%d",
 			old.Port, new.Port)
 	}
-	// Validate Cluster.Advertise syntax
+	// Validate Cluster.Advertise syntax against the listener transport.
 	if new.Advertise != "" {
-		if _, _, err := parseHostPort(new.Advertise, 0); err != nil {
+		if err := validateClusterListenTransport(&new); err != nil {
 			return fmt.Errorf("invalid Cluster.Advertise value of %s, err=%v", new.Advertise, err)
+		}
+		if !hasUnixScheme(new.Advertise) {
+			if _, _, err := parseHostPort(new.Advertise, 0); err != nil {
+				return fmt.Errorf("invalid Cluster.Advertise value of %s, err=%v", new.Advertise, err)
+			}
 		}
 	}
 	return nil

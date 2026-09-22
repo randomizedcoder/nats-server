@@ -19,7 +19,7 @@ In scope:
 - Route **solicitation** (dialing) to a UDS.
 - Mixed clusters: a server may listen on UDS and dial some peers over TCP and others
   over UDS, and the reverse.
-- Config file, CLI flags, `nats-server --config-check`, config reload semantics.
+- Config file, CLI flags, `nats-server -t` (config check), config reload semantics.
 - Monitoring (`/varz`, `/routez`, `$SYS ... STATSZ`) fields for UDS transports so the
   out-of-tree Prometheus exporter can surface them.
 - Cross-platform behaviour: Linux, macOS, the BSDs, Windows (AF_UNIX since Windows 10
@@ -87,7 +87,10 @@ Validation rules (all produce a config error with the offending value quoted):
 5. Abstract form: at least one character after `@`.
 6. The **native** form must fit `sun_path`: 108 bytes on Linux, Solaris and Windows,
    104 on macOS and the BSDs. The limit is taken from
-   `len(syscall.RawSockaddrUnix{}.Path)` so it always matches the build target.
+   `len(syscall.RawSockaddrUnix{}.Path)` so it always matches the build target. A
+   pathname may use at most `sun_path - 1` bytes (Go's `SockaddrUnix` reserves the
+   terminating NUL on every OS and returns `EINVAL` otherwise); an abstract name may
+   fill `sun_path` because its `@` stands in for the leading NUL.
 
 Credentials for route authentication use the existing route URL user-info syntax and
 are also accepted on UDS routes: `unix://ruser:top_secret@/run/nats/b.sock` is **not**
@@ -392,7 +395,7 @@ Each phase is independently reviewable and leaves `main` green. Commits are sign
 |---|---|---|---|
 | 0 | Open a GitHub issue describing the feature and linking this doc. | — | Maintainer acknowledgement. |
 | 1 | Address parsing, canonical URL helpers, per-platform `nativeUnixAddr` and `maxUnixSocketPathLen`. | `server/uds.go`, `uds_unix.go`, `uds_windows.go`, `uds_sockaddr*.go` | §6.1–6.3 tables pass on Linux and under `GOOS=windows go vet`. |
-| 2 | Options: `ClusterOpts.UnixSocket`, `listen`/`-cluster`/`routes`/`-routes`/`advertise` parsing, `listenEnabled()`, `validateCluster` rules, reload rejection. | `server/opts.go`, `server/server.go`, `server/reload.go`, `server/jetstream.go`, `server/mqtt.go`, `server/events.go` | §6.4–6.5 pass; `TestConfigCheck` extended; `nats-server --config-check` on the §7 configs succeeds. A server with a unix `advertise` cannot start until phase 4, so `--config-check` is the only runtime check here. |
+| 2 | Options: `ClusterOpts.UnixSocket`, `listen`/`-cluster`/`routes`/`-routes`/`advertise` parsing, `listenEnabled()`, `validateCluster` rules, reload rejection. | `server/opts.go`, `server/server.go`, `server/reload.go`, `server/jetstream.go`, `server/mqtt.go`, `server/events.go` | §6.4–6.5 pass; `TestConfigCheck` extended; `nats-server -t` on the §7 configs succeeds. A server with a unix `advertise` cannot start until phase 4, so `-t` is the only runtime check here. |
 | 3 | Listener: `listenRouteUnix`, stale-socket logic, `startRouteAcceptLoop` transport switch, self-route map, `ClusterUnixAddr`, `PortsInfo`. | `server/route.go`, `server/server.go`, `server/uds.go` | §6.6–6.7 pass; a single server starts and stops cleanly on a UDS and the file is gone after `Shutdown`. |
 | 4 | Dial and gossip: `connectToRoute` branch, `processRouteInfo`, `processImplicitRoute`, `hasThisRouteConfigured`, `setRouteInfoHostPortAndIP`, TLS name fallback. | `server/route.go`, `server/client.go` | §6.8–6.9 and the in-process three-server mesh test pass with `-race`. |
 | 5 | Monitoring: `udsStats`, `ClusterOptsVarz`, `RouteInfo`, `RouteStat`, ports file. | `server/monitor.go`, `server/events.go`, `server/server.go` | §6.10 pass; `/varz` and `/routez` JSON verified in the integration script. |
@@ -496,7 +499,7 @@ address from (a) the canonical URL, (b) `url.Parse(in)`, (c) `url.Parse(canonica
 Rows: pathname, abstract, windows drive, and a negative row for `nats-route://` returning
 `ok == false`, plus a corner row for `url.Parse("unix://@name")` landing in `User`/`Host`.
 
-### 6.4 `TestClusterOptsUnixSocketConfig` (`server/opts_test.go`)
+### 6.4 `TestClusterOptsUnixSocketConfig` (`server/opts_uds_test.go`)
 
 Row shape `{description, config string, expected ClusterOpts fields, expectedErr string}`
 using `createConfFile` + `ProcessConfigFile`.
@@ -518,13 +521,13 @@ using `createConfFile` + `ProcessConfigFile`.
 | negative | duplicate unix route | `routes: ["unix:///run/b.sock", "unix:///run/b.sock"]` | warning `Duplicate route entry detected` |
 | boundary | listen path at OS limit | generated | accepted |
 | boundary | listen path over OS limit | generated | err `too long` |
-| corner | unix listen as a quoted string only (bare token is a parse error in the conf grammar) | `listen: unix:///run/a.sock` | err from the config lexer (documents that quoting is required) |
+| corner | unquoted unix listen (the conf lexer does not treat `//` after `:` as a comment) | `listen: unix:///run/a.sock` | `UnixSocket=/run/a.sock`; quoting is optional |
 | corner | scheme case in config | `listen: "UNIX:///run/a.sock"` | `UnixSocket=/run/a.sock` |
 
 `TestConfigCheck` (`server/config_check_test.go`) gains the negative rows above with
 exact `errorLine`/`errorPos`.
 
-### 6.5 `TestClusterUnixFlags` (`server/opts_test.go`)
+### 6.5 `TestClusterUnixFlags` (`server/opts_uds_test.go`)
 
 Row shape `{description, args []string, expected ClusterOpts / Routes, expectedErr}` via
 `ConfigureOptions`:
@@ -696,7 +699,7 @@ Script steps (bash, `set -euo pipefail`, no external deps beyond `curl`, `ss`, a
 `nats` CLI which is fetched via `nix shell nixpkgs#natscli` when missing):
 
 1. `go build -o "$OUT/nats-server" .` and print `nats-server --version`.
-2. `nats-server --config-check -c` each config.
+2. `nats-server -t -c` each config.
 3. Start A, B, C in the background with `-l "$OUT/<name>.log"`; record PIDs.
 4. Wait up to 10 s until each `/routez` reports `num_routes == 2` and every route has
    `"transport":"unix"`.

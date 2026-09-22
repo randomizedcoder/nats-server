@@ -718,7 +718,7 @@ func validateMQTTOptions(o *Options) error {
 	}
 	// We have to force the server name to be explicitly set and be unique when
 	// in cluster mode.
-	if o.ServerName == _EMPTY_ && (o.Cluster.Port != 0 || o.Gateway.Port != 0) {
+	if o.ServerName == _EMPTY_ && (o.Cluster.listenEnabled() || o.Gateway.Port != 0) {
 		return errMQTTServerNameMustBeSet
 	}
 	// If there is a NoAuthUser, we need to have Users defined and
@@ -747,7 +747,7 @@ func validateMQTTOptions(o *Options) error {
 	// For leafnodes, we could either have remote(s) and it would be ok, or no
 	// remote but accept from a remote side that has "hub" property set, which
 	// then would ok too. So we fail only if we have no leafnode config at all.
-	if !o.JetStream && o.Cluster.Port == 0 && o.Gateway.Port == 0 &&
+	if !o.JetStream && !o.Cluster.listenEnabled() && o.Gateway.Port == 0 &&
 		o.LeafNode.Port == 0 && len(o.LeafNode.Remotes) == 0 {
 		return errMQTTStandaloneNeedsJetStream
 	}

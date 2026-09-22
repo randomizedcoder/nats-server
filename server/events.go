@@ -911,7 +911,7 @@ func (s *Server) sendStatsz(subj string) {
 
 	shouldCheckInterest := func() bool {
 		opts := s.getOpts()
-		if opts.Cluster.Port != 0 || opts.Gateway.Port != 0 || opts.LeafNode.Port != 0 {
+		if opts.Cluster.listenEnabled() || opts.Gateway.Port != 0 || opts.LeafNode.Port != 0 {
 			return false
 		}
 		// If we are here we have no clustering or gateways and are not a leafnode hub.
