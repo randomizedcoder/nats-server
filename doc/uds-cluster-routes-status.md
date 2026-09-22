@@ -119,10 +119,13 @@ Files: `server/route.go`, `server/client.go`
 - [x] `doTLSHandshake` ServerName fallback and explicit error for UDS with no name (`errRouteTLSUnixNoName`, connection closed so the route retries)
 - [x] Audit every `c.route.url` dereference for nil on accept-side UDS routes (16 sites; all solicit-only, nil-checked, or nil-safe `Redacted()`; the one accept-side site in `processRouteInfo` is nil-checked)
 - [x] `sendRouteConnect`: explicit `unix://` routes without user-info fall back to the dialing server's cluster `authorization {}` credentials (found by `TestProcessImplicitRouteUnix`; §3.1 updated)
+- [x] `unixRouteURLFromString`: gossiped `IP` may be the `url.URL.String()` form with percent-encoded non-ASCII path bytes; `processRouteInfo`, `processImplicitRoute` and `hasThisRouteConfigured` accept both forms (Dave, post-review)
+- [x] `updateUnixRoutesToSelf`: self-route skip set rebuilt on startup and on cluster reload so an `advertise` change drops the stale entry (Dave, post-review); `connectToRoute` now does the self lookup under the server lock because reload rewrites the map
+- [x] Mixed old/new cluster behaviour measured with `main` binaries (design §4.4.1)
 
 Tests:
 
-- [x] §6.8 `TestRouteInfoUnix`, `TestHasThisRouteConfiguredUnix`, `TestProcessImplicitRouteUnix`
+- [x] §6.8 `TestRouteInfoUnix`, `TestHasThisRouteConfiguredUnix`, `TestProcessImplicitRouteUnix` (plus percent-encoded canonical URL rows), `TestUnixRouteURLFromString`
 - [x] §6.9 `TestRouteUnixDial` (explicit, abstract, missing path retry, error text, implicit retry budget, backoff, reload removal, self skip, peer close, cluster authorization good/bad/missing)
 - [x] §6.11 `TestRouteUnixReload` add/remove rows (route add, no-op, advertise add/change/remove, rejections)
 - [x] §6.12 `TestRouteUnixTLS` (hostname from TCP route, insecure, no name, ip-only)
@@ -180,7 +183,7 @@ Record decisions here with the date so they are not re-litigated.
 |---|---|---|
 | 2026-09-22 | Credentials inside `unix://` URLs? | No. `@` collides with abstract marker; use cluster `authorization {}` (§3.1). Revisit if maintainers ask. |
 | 2026-09-22 | Advertise listen path by default for UDS? | No. Paths are namespace-local; explicit routes form the mesh (§4.4). |
-| 2026-09-22 | Route `Proto` bump? | Not proposed; documented as unsupported for mixed old/new clusters (§9). |
+| 2026-09-22 | Route `Proto` bump? | Not proposed. Mixed old/new behaviour measured (§4.4.1): degrades to explicit routes with one error line per gossiped unix-only peer on old servers. Offer a `Proto` gate only if maintainers ask. |
 | | TLS over UDS on the dial side when no hostname exists? | Proposed: explicit error (§4.6). Awaiting maintainer view. |
 | | `unix_socket_mode` option in v1? | Proposed: no, directory permissions (§4.3.1). |
 
@@ -272,6 +275,60 @@ Script bug found while writing it: the evidence helper teed into the same file `
 reading, truncating it first, so `/varz` checks failed at random. Fixed by displaying saved
 files without re-teeing. Not a server bug.
 
+Post-review (2026-09-22), mixed old/new cluster. Binaries: `main` (`edb1b17a`, built with
+`-buildvcs=false` from a worktree) as `old-1`/`old-2` meshed over TCP (`connect_retries: 2`),
+branch binary as `new-uds` with `listen: "unix:///tmp/nats-mixed/n.sock"` and
+`routes = [ nats-route://127.0.0.1:16322 ]` (old-1 only), started after the old pair meshed.
+
+```
+# newcomer without advertise: old-2 (debug logging) is gossiped nats-route://127.0.0.1:0/
+[DBG] Trying to connect to route on 127.0.0.1:0 (127.0.0.1:0)
+[ERR] Error trying to connect to route (attempt 1): dial tcp 127.0.0.1:0: connect: connection refused
+[DBG] Error trying to connect to route (attempt 2): dial tcp 127.0.0.1:0: connect: connection refused
+[DBG] Error trying to connect to route (attempt 3): dial tcp 127.0.0.1:0: connect: connection refused
+# newcomer with advertise: "unix:///tmp/nats-mixed/n.sock": old-2 is gossiped the unix URL
+[ERR] Error trying to connect to route (attempt 1): missing port in address
+# routez peers afterwards (pool_size 3), both cases
+old-1:   3 x new-uds, 3 x old-2
+old-2:   3 x old-1
+new-uds: 3 x old-1 (transport tcp)
+```
+
+When the newcomer started *before* the old pair finished forming its pool, old-1 forwarded
+old-2's INFO to the newcomer as a side effect and the newcomer dialed old-2 over TCP, giving a
+full mesh. That is ordering luck, not a guarantee; the steady-state rule is the table in
+design §4.4.1. An all-`main` control with the same ordering behaved identically apart from the
+error text, confirming the "newcomer learns nothing from the seed" gossip direction is
+pre-existing.
+
+Post-review (2026-09-22), the two failures Dave saw in a full `go test ./server`:
+`TestServerEventsHealthZClustered_NoReplicas` and `TestGatewayImplicitReconnect` pass 3/3 on
+the branch and 3/3 on a clean `main` worktree. The CI `srv_pkg_non_js_tests` shard command
+(`-race -p=1 -failfast`, same regex and tags as `scripts/runTestsOnTravis.sh`) was run on the
+branch; first attempt stopped at 552 passes on
+`TestLeafNodeWithWeightedDQRequestsToSuperClusterWithSeparateAccounts` with
+`route(listen tcp 127.0.0.1:24024: bind: address already in use)` while the mixed-version
+smoke above was running alongside it; that test passes 2/2 in isolation. Second, solo attempt
+stopped at 653 passes on `TestSubszOperatorMode` with `server(listen tcp 127.0.0.1:5500: bind:
+address already in use)`; that test and its predecessor at `monitor_test.go:4665` both hard-code
+port 5500, and it passes 3/3 in isolation. Neither failure touches unix routes. Third run
+without `-failfast`: the package binary still aborts on the first panic; it died on
+`TestGatewayIgnoreSelfReference` (`gateway(listen tcp 127.0.0.1:5222: bind: address already in
+use)`, its predecessor `TestGatewayBasic` hard-codes gateway port 5222) after 468 passes, plus
+`TestPSEmulationCPU` in `server/pse` (`CPUs did not match close enough: 0.000000 vs 50.000000`).
+Both pass or fail identically off-branch: the gateway test passes 3/3 alone, and
+`TestPSEmulationCPU` fails 3/3 on clean `main` too (procps `ps` output on NixOS; the branch
+does not touch `server/pse`).
+
+Control: the identical shard on a clean `main` worktree (`edb1b17a`) aborted the same way,
+673 passes then `TestLeafNodeWithWeightedDQRequestsToSuperClusterWithSeparateAccounts` with
+`route(listen tcp 127.0.0.1:22280: bind: address already in use)` and the same
+`TestPSEmulationCPU` failure. Conclusion: this shard cannot complete on this machine on any
+branch because of hard-coded test ports and the `ps` emulation check; nothing in the four
+attempts points at unix routes. Across the four runs every test that got to run passed except
+those fixed-port panics and `TestPSEmulationCPU`. The clean full-CI signal has to come from
+GitHub Actions on the draft PR.
+
 ## Session log
 
 | Date | Work done | Next |
@@ -283,3 +340,4 @@ files without re-teeing. Not a server bug.
 | 2026-09-22 | Phase 4 done: `setRouteInfoHostPortAndIP` transport cases, `connectToRoute` unix dial with self skip and counters, `processRouteInfo`/`processImplicitRoute`/`hasThisRouteConfigured` unix `info.IP` handling, `saveRouteTLSName` skip, `doTLSHandshake` name fallback and `errRouteTLSUnixNoName`, `sendRouteConnect` cluster-auth fallback for explicit unix routes (design gap found by test; §3.1 updated). Dial, reload, TLS, mesh and topology tables plus 100k-message no-race fan-out green; `-race` on route/unix/cluster sets and `./test` suites green; windows vet, wasm/darwin/freebsd builds ok. Committed. | Phase 5: `route.transport`, Varz `UnixSocket`/`UnixSocketStats`, Routez `Transport`/`UnixSocket`, STATSZ `RouteStat.Transport`, `TestRouteUnixMonitoring`, golden TCP `/varz` fragment. |
 | 2026-09-22 | Phase 5 done: `route.transport` captured at creation, `RouteUnixSocketStats` and `ClusterOptsVarz.UnixSocket`/`UnixSocketStats` (nil for TCP-only servers, golden test), `RouteInfo.Transport`/`UnixSocket` with nil-safe `Routez` address switch, `RouteStat.Transport` in STATSZ. Fixed `dialed` to count successes only (design §3.3). `/varz` `cluster.urls` now renders unix routes (found by the three-process smoke). Monitoring tables over HTTP and API green under `-race`; monitor/varz/routez/events regressions, `./test` suites, cross builds and golangci-lint checked. Committed. Stopped for review. | Review phases 1-5; then phase 6 (multi-process configs, `scripts/uds-cluster-smoke.sh`, `ss -xp` evidence) and phase 7 (issue, draft PR). |
 | 2026-09-22 | Phase 6 done: `test/configs/uds/srv_{a,b,c}.conf` and `srv_{a,b,c}_pairs.conf`, `scripts/uds-cluster-smoke.sh` (build, `-t`, start, wait for two unix peers per server, `ss -xlp`/`ss -xp` evidence, pub/sub, `nats bench`, SIGKILL/restart with stale-socket check, SIGTERM with no leftover sockets, PASS/FAIL summary), `UDS_PAIRS=1` socat ring and `UDS_PROXY=1` hook for the real proxy, `test/configs/uds/README.md`. Design §7.2/§7.3 updated to the shipped script (peer-count criterion, real log text). Five full-mesh runs and one ring run green. Committed. | Dave: run `UDS_PAIRS=1 UDS_PROXY=1 scripts/uds-cluster-smoke.sh` against `uds-over-rdma-proxy` and paste evidence; write the GitHub issue; then phase 7 (rebase, draft PR with hand-written description). |
+| 2026-09-22 | Post-review: Dave added `unixRouteURLFromString` (percent-encoded gossip form) and `updateUnixRoutesToSelf` (reload-safe self-route set) with regression rows; `connectToRoute` self lookup moved under the server lock (reload now rewrites the map). Mixed old/new cluster behaviour measured with `main` binaries and written up as design §4.4.1 for the PR note; §9 and the open-questions row updated. Full UDS/config/reload slice green under `-race`; CI `srv_pkg_non_js_tests` shard attempted four times (three on the branch, one on clean `main`): every attempt aborts on a pre-existing fixed-port bind panic or `TestPSEmulationCPU`, identically on `main`, so a clean full run must come from GitHub CI. | Dave: GitHub issue, real-proxy evidence, PR description (mixed-version paragraph from §4.4.1), decide squash vs. per-phase. |

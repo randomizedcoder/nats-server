@@ -594,6 +594,7 @@ func TestHasThisRouteConfiguredUnix(t *testing.T) {
 		{description: "match among mixed routes", routes: []string{"nats-route://127.0.0.1:6222", "unix:///run/b.sock"}, info: Info{IP: "unix:///run/b.sock"}, expected: true},
 		{description: "tcp info still matches tcp route", routes: []string{"nats-route://127.0.0.1:6222"}, info: Info{Host: "127.0.0.1", Port: 6222}, expected: true},
 		{description: "gossiped scheme case differs", routes: []string{"unix:///run/b.sock"}, info: Info{IP: "UNIX:///run/b.sock"}, expected: true},
+		{description: "gossiped canonical URL is percent-encoded", routes: []string{"unix:///run/ñ.sock"}, info: Info{IP: unixRouteURL("/run/ñ.sock").String()}, expected: true},
 		// negative
 		{description: "path differs by trailing component", routes: []string{"unix:///run/b.sock"}, info: Info{IP: "unix:///run/b.sock2"}, expected: false},
 		{description: "tcp configured, unix info", routes: []string{"nats-route://127.0.0.1:6222"}, info: Info{IP: "unix:///run/b.sock"}, expected: false},
@@ -661,6 +662,11 @@ func TestProcessImplicitRouteUnix(t *testing.T) {
 		{
 			description:  "unix IP not configured is dialed",
 			info:         func(s *Server, peer string) *Info { return &Info{ID: "peer", IP: unixSchemePrefix + peer} },
+			expectedDial: true,
+		},
+		{
+			description:  "gossiped canonical URL is dialed",
+			info:         func(s *Server, peer string) *Info { return &Info{ID: "peer", IP: unixRouteURL(peer).String()} },
 			expectedDial: true,
 		},
 		// negative
@@ -1083,14 +1089,17 @@ func TestRouteUnixReload(t *testing.T) {
 		expectedRoutes int
 		// expectedIP is A's advertised INFO IP after the reload.
 		expectedIP string
+		// expectedSelf and unexpectedSelf assert the unix self-route map after reload.
+		expectedSelf   []string
+		unexpectedSelf []string
 	}{
 		// positive
 		{description: "adding a unix route dials it", conf: unixClusterConf("a", aSock, _EMPTY_, bRoute), expectedRoutes: 1},
 		{description: "same route again is a no-op", conf: unixClusterConf("a", aSock, _EMPTY_, bRoute), expectedRoutes: 1},
-		{description: "adding a unix advertise is accepted and applied", conf: unixClusterConf("a", aSock, "unix:///p/a.sock", bRoute), expectedRoutes: 1, expectedIP: "unix:///p/a.sock"},
-		{description: "changing between unix advertise paths is accepted", conf: unixClusterConf("a", aSock, "unix:///p/a2.sock", bRoute), expectedRoutes: 1, expectedIP: "unix:///p/a2.sock"},
+		{description: "adding a unix advertise is accepted and applied", conf: unixClusterConf("a", aSock, "unix:///p/a.sock", bRoute), expectedRoutes: 1, expectedIP: "unix:///p/a.sock", expectedSelf: []string{aSock, "/p/a.sock"}},
+		{description: "changing between unix advertise paths is accepted", conf: unixClusterConf("a", aSock, "unix:///p/a2.sock", bRoute), expectedRoutes: 1, expectedIP: "unix:///p/a2.sock", expectedSelf: []string{aSock, "/p/a2.sock"}, unexpectedSelf: []string{"/p/a.sock"}},
 		{description: "removing the unix route closes it", conf: unixClusterConf("a", aSock, "unix:///p/a2.sock"), expectedRoutes: 0, expectedIP: "unix:///p/a2.sock"},
-		{description: "removing the advertise is accepted", conf: unixClusterConf("a", aSock, _EMPTY_), expectedRoutes: 0},
+		{description: "removing the advertise is accepted", conf: unixClusterConf("a", aSock, _EMPTY_), expectedRoutes: 0, expectedSelf: []string{aSock}, unexpectedSelf: []string{"/p/a2.sock"}},
 		// negative
 		{description: "changing the unix path is rejected", conf: unixClusterConf("a", tempSocketPath(t, "a2.sock"), _EMPTY_), expectedErr: "config reload not supported for cluster unix socket"},
 		{description: "changing listen from unix to tcp is rejected", conf: "server_name: a\nlisten: 127.0.0.1:-1\ncluster { name: uds, pool_size: -1, listen: 127.0.0.1:-1 }\n", expectedErr: "config reload not supported for cluster unix socket"},
@@ -1116,10 +1125,23 @@ func TestRouteUnixReload(t *testing.T) {
 			}
 			sa.mu.RLock()
 			ip := sa.routeInfo.IP
-			sa.mu.RUnlock()
 			if ip != tc.expectedIP {
+				sa.mu.RUnlock()
 				t.Fatalf("routeInfo.IP = %q, expected %q", ip, tc.expectedIP)
 			}
+			for _, self := range tc.expectedSelf {
+				if _, ok := sa.unixRoutesToSelf[self]; !ok {
+					sa.mu.RUnlock()
+					t.Fatalf("expected unixRoutesToSelf to contain %q", self)
+				}
+			}
+			for _, self := range tc.unexpectedSelf {
+				if _, ok := sa.unixRoutesToSelf[self]; ok {
+					sa.mu.RUnlock()
+					t.Fatalf("expected unixRoutesToSelf not to contain %q", self)
+				}
+			}
+			sa.mu.RUnlock()
 		})
 	}
 }

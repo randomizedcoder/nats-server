@@ -137,6 +137,28 @@ func unixRouteURL(addr string) *url.URL {
 	return &url.URL{Scheme: "unix", Path: addr}
 }
 
+// unixRouteURLFromString parses a unix route URL that may have arrived over
+// route INFO. It accepts the strict configuration form and the canonical
+// url.URL.String form emitted by unixRouteURL, where non-ASCII path bytes are
+// percent-encoded on the wire.
+func unixRouteURLFromString(raw string) (*url.URL, error) {
+	if addr, err := parseUnixAddr(raw); err == nil {
+		return unixRouteURL(addr), nil
+	}
+	u, err := url.Parse(raw)
+	if err != nil {
+		return nil, fmt.Errorf("unable to parse unix socket address %q: %w", raw, err)
+	}
+	addr, ok := unixAddrFromRouteURL(u)
+	if !ok {
+		return nil, fmt.Errorf("invalid unix route URL %q", raw)
+	}
+	if _, err := parseUnixAddr(unixSchemePrefix + addr); err != nil {
+		return nil, err
+	}
+	return unixRouteURL(addr), nil
+}
+
 // unixAddrFromRouteURL returns the URL-form UDS address of a route URL, or
 // ok=false when u is not a UDS route URL.
 //
@@ -195,6 +217,24 @@ func routeTransport(nc net.Conn) string {
 		}
 	}
 	return routeTransportTCP
+}
+
+// updateUnixRoutesToSelf records the unix socket addresses this server should
+// never dial as routes to itself. Server lock is held on entry.
+func (s *Server) updateUnixRoutesToSelf(c *ClusterOpts) {
+	if s.unixRoutesToSelf == nil {
+		s.unixRoutesToSelf = make(map[string]struct{})
+	}
+	clear(s.unixRoutesToSelf)
+	if c.UnixSocket == _EMPTY_ {
+		return
+	}
+	s.unixRoutesToSelf[c.UnixSocket] = struct{}{}
+	if hasUnixScheme(c.Advertise) {
+		if addr, err := parseUnixAddr(c.Advertise); err == nil {
+			s.unixRoutesToSelf[addr] = struct{}{}
+		}
+	}
 }
 
 // listenRouteUnix binds the route listener to the unix domain socket at the

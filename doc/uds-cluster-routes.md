@@ -334,10 +334,37 @@ handled by the address and not by the wrapper. `*net.TCPAddr` keeps today's beha
 `*net.UnixAddr` sets `info.IP = c.route.url.String()` only when a URL is known (solicited
 side) and otherwise leaves `info.IP` empty. `Routez` gets the identical switch.
 
-Backward compatibility: a pre-UDS server that receives `Host=""`/`Port=0` would build
-`nats-route://:0/` and fail to dial it. Mixed old/new clusters that include UDS servers
-are therefore unsupported and the release note says so. TCP-only clusters see no wire
-change.
+#### 4.4.1 Mixed old/new clusters (measured)
+
+No route `Proto` bump is proposed. The wire format is unchanged: a server built from this
+branch with a TCP listener sends byte-identical route `INFO`, so upgrading a TCP cluster
+is unaffected. The only behaviour change is on a server that *listens* on a unix socket,
+and it follows from how NATS gossip works: a newcomer never learns existing peers from
+the server it dials. The seed forwards the newcomer's `INFO` to the existing servers, and
+they dial the newcomer. Whether the existing servers are old or new, they can only dial
+what the newcomer advertises.
+
+Measured on 2026-09-22 with two `main` (`edb1b17a`) servers meshed over TCP and one
+branch server listening on `unix:///tmp/nats-mixed/n.sock` with a single explicit
+`nats-route://` to the first old server:
+
+| Newcomer `cluster.advertise` | Old seed | Other old server | Result |
+|---|---|---|---|
+| unset | Accepts the TCP route; manufactures `nats-route://:0/` for its own bookkeeping and gossips `nats-route://127.0.0.1:0/` | Logs `Error trying to connect to route (attempt 1): dial tcp 127.0.0.1:0: connect: connection refused`, retries `connect_retries` times at debug level, gives up | Newcomer is connected only to the servers it lists explicitly |
+| `unix:///tmp/nats-mixed/n.sock` | Accepts the TCP route; gossips `unix:///tmp/nats-mixed/n.sock` unchanged | Logs `Error trying to connect to route (attempt 1): missing port in address`, retries, gives up | Same |
+
+In both rows the old servers stay healthy, keep their own mesh and keep the route the
+newcomer opened to them. The newcomer is a leaf of the mesh unless it lists every server
+it needs as an explicit route, which is exactly the rule §4.4 already states for new-only
+clusters without `advertise`. A branch server sees the same gossip and skips the dial
+silently (no address) or dials the path (advertised), so old servers only add the one
+error line per gossiped peer.
+
+Recommendation for the release note: upgrade every server before adding a unix socket
+listener, list explicit routes for unix-socket servers, and expect the one error line on
+any pre-upgrade server that is gossiped a unix-only peer. Mixed clusters are therefore
+"degraded to explicit routes", not broken; §9 keeps the option of gating on `Proto` if
+maintainers want a hard error instead.
 
 ### 4.5 "Clustering enabled" predicate
 
@@ -769,7 +796,7 @@ script asserts that `socat` appears there in the dry run.
 |---|---|
 | Panics from `(*net.TCPAddr)` assertions on the new listener type. | Every site is listed in §2 and replaced by a type switch; a unit test starts a UDS server and calls every accessor. |
 | Behaviour change for TCP clusters. | No wire change when `UnixSocket` is empty; golden `/varz` JSON test; full existing route suite runs unchanged. |
-| Old servers in a mixed cluster mis-handle `Port=0` INFO. | Documented as unsupported. No route `Proto` bump is proposed; if maintainers prefer one, a UDS-listening server can refuse routes from peers with an older `Proto` with a clear error. |
+| Old servers in a mixed cluster mis-handle `Port=0` or `unix://` INFO. | Measured (§4.4.1): old servers log one dial error per gossiped unix-only peer and give up after `connect_retries`; the mesh degrades to the newcomer's explicit routes, nothing breaks. No route `Proto` bump is proposed; if maintainers prefer one, a UDS-listening server can refuse routes from peers with an older `Proto` with a clear error. |
 | Stale-socket removal deleting something it should not. | Only removes if `Lstat` says socket **and** a dial gets `ECONNREFUSED`; never follows symlinks; covered by §6.6. |
 | Long temp paths in tests on macOS. | `tempSocketPath` helper with a hard assertion. |
 | Route TLS with no hostname. | Explicit error message, §6.12. |

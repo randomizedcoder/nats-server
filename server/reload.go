@@ -429,6 +429,7 @@ func (c *clusterOption) Apply(s *Server) {
 		s.routeInfo.WSConnectURLs = s.websocket.connectURLs
 	}
 	s.setRouteInfoHostPortAndIP()
+	s.updateUnixRoutesToSelf(&c.newValue)
 	var routes []*client
 	if c.compressChanged {
 		co := &s.getOpts().Cluster.Compression

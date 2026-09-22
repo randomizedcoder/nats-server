@@ -245,6 +245,40 @@ func TestUnixAddrFromRouteURLRejects(t *testing.T) {
 	}
 }
 
+func TestUnixRouteURLFromString(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		description string
+		in          string
+		expected    string
+		expectedErr string
+	}{
+		// positive
+		{description: "config form", in: "unix:///run/a.sock", expected: "/run/a.sock"},
+		{description: "canonical unicode form", in: unixRouteURL("/run/ñ.sock").String(), expected: "/run/ñ.sock"},
+		{description: "abstract form", in: "unix://@a", expected: "@a"},
+		// negative
+		{description: "not unix", in: "nats-route://127.0.0.1:6222", expectedErr: "invalid unix route URL"},
+		{description: "relative unix path", in: "unix://relative", expectedErr: "invalid unix route URL"},
+	} {
+		t.Run(tc.description, func(t *testing.T) {
+			u, err := unixRouteURLFromString(tc.in)
+			if tc.expectedErr != _EMPTY_ {
+				if err == nil || !strings.Contains(err.Error(), tc.expectedErr) {
+					t.Fatalf("expected error containing %q, got %v", tc.expectedErr, err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if got, ok := unixAddrFromRouteURL(u); !ok || got != tc.expected {
+				t.Fatalf("unixRouteURLFromString(%q) recovered %q, %v; expected %q, true", tc.in, got, ok, tc.expected)
+			}
+		})
+	}
+}
+
 func mustParseURL(t *testing.T, s string) *url.URL {
 	t.Helper()
 	u, err := url.Parse(s)

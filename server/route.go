@@ -859,14 +859,14 @@ func (c *client) processRouteInfo(info *Info) {
 	// pool and duplicate handling tolerate for a non-solicited route.
 	if c.route.url == nil {
 		if hasUnixScheme(info.IP) {
-			addr, err := parseUnixAddr(info.IP)
+			u, err := unixRouteURLFromString(info.IP)
 			if err != nil {
 				c.Errorf("Error parsing URL from INFO: %v\n", err)
 				c.mu.Unlock()
 				c.closeConnection(ParseError)
 				return
 			}
-			c.route.url = unixRouteURL(addr)
+			c.route.url = u
 		} else if info.Host != _EMPTY_ || info.Port != 0 {
 			// Add in the URL from host and port
 			hp := net.JoinHostPort(info.Host, strconv.Itoa(info.Port))
@@ -1124,12 +1124,12 @@ func (s *Server) processImplicitRoute(info *Info, routeNoPool bool) {
 	if hasUnixScheme(info.IP) {
 		// Keep the canonical form: url.Parse would put an abstract
 		// name in Host, and credentials added below would then hide it.
-		addr, err := parseUnixAddr(info.IP)
+		u, err := unixRouteURLFromString(info.IP)
 		if err != nil {
 			s.Errorf("Error parsing URL from INFO: %v\n", err)
 			return
 		}
-		r = unixRouteURL(addr)
+		r = u
 	} else {
 		var err error
 		r, err = url.Parse(info.IP)
@@ -1168,10 +1168,11 @@ func (s *Server) hasThisRouteConfigured(info *Info) bool {
 	// A unix socket address is compared as a whole, case-sensitively:
 	// paths are case-sensitive on Linux and a sun_path is a byte string.
 	if hasUnixScheme(info.IP) {
-		addr, err := parseUnixAddr(info.IP)
+		u, err := unixRouteURLFromString(info.IP)
 		if err != nil {
 			return false
 		}
+		addr, _ := unixAddrFromRouteURL(u)
 		for _, ri := range routes {
 			if ra, ok := unixAddrFromRouteURL(ri); ok && ra == addr {
 				return true
@@ -2916,12 +2917,7 @@ func (s *Server) startRouteAcceptLoop() {
 	// A unix socket listener has no ip:port; record its own path (and the
 	// advertised path, if any) instead so that connectToRoute skips them.
 	if unixSocket != _EMPTY_ {
-		s.unixRoutesToSelf[unixSocket] = struct{}{}
-		if adv := opts.Cluster.Advertise; hasUnixScheme(adv) {
-			if advAddr, err := parseUnixAddr(adv); err == nil {
-				s.unixRoutesToSelf[advAddr] = struct{}{}
-			}
-		}
+		s.updateUnixRoutesToSelf(&opts.Cluster)
 	} else if interfaceAddr, err := net.InterfaceAddrs(); err == nil {
 		var localIPs []string
 		for i := 0; i < len(interfaceAddr); i++ {
@@ -3045,19 +3041,20 @@ func (s *Server) connectToRoute(rURL *url.URL, rtype RouteType, firstConnect boo
 
 	const connErrFmt = "Error trying to connect to route (attempt %v): %v"
 
+	// A unix socket route is dialed by path; there is no name to resolve.
+	// The self check happens under the lock because a cluster reload
+	// rewrites unixRoutesToSelf when the advertise address changes.
+	unixAddr, isUnix := unixAddrFromRouteURL(rURL)
+
 	s.mu.RLock()
 	resolver := s.routeResolver
 	excludedAddresses := s.routesToSelf
-	excludedUnixAddresses := s.unixRoutesToSelf
+	_, unixSelf := s.unixRoutesToSelf[unixAddr]
 	s.mu.RUnlock()
 
-	// A unix socket route is dialed by path; there is no name to resolve.
-	unixAddr, isUnix := unixAddrFromRouteURL(rURL)
-	if isUnix {
-		if _, self := excludedUnixAddresses[unixAddr]; self {
-			s.Debugf("Not attempting to connect to route %q, it is this server's own unix socket", rURL.Redacted())
-			return
-		}
+	if isUnix && unixSelf {
+		s.Debugf("Not attempting to connect to route %q, it is this server's own unix socket", rURL.Redacted())
+		return
 	}
 
 	attemptDelay := routeConnectDelay
