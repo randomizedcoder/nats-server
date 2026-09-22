@@ -16,12 +16,16 @@ package server
 import (
 	"fmt"
 	"net"
+	"net/url"
 	"os"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/nats-io/nats.go"
 )
 
 // tempSocketDir returns a short-lived directory for unix sockets. It is
@@ -521,6 +525,879 @@ func TestFormatURLUnix(t *testing.T) {
 			if fmt.Sprint(got) != fmt.Sprint(tc.expected) {
 				t.Fatalf("formatURL(%q, %v) = %v, expected %v", tc.protocol, tc.addr, got, tc.expected)
 			}
+		})
+	}
+}
+
+// TestRouteInfoUnix covers the INFO fields a server advertises to its peers
+// for each listener and advertise combination (design doc §6.8).
+func TestRouteInfoUnix(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		description string
+		cluster     ClusterOpts
+		expected    Info
+		expectedErr string
+	}{
+		// positive
+		{description: "tcp no advertise", cluster: ClusterOpts{Host: "127.0.0.1", Port: 6222}, expected: Info{Host: "127.0.0.1", Port: 6222}},
+		{description: "tcp with advertise", cluster: ClusterOpts{Host: "127.0.0.1", Port: 6222, Advertise: "10.0.0.1:6333"}, expected: Info{Host: "10.0.0.1", Port: 6333, IP: "nats-route://10.0.0.1:6333/"}},
+		{description: "tcp with host-only advertise keeps the listen port", cluster: ClusterOpts{Host: "127.0.0.1", Port: 6222, Advertise: "10.0.0.1"}, expected: Info{Host: "10.0.0.1", Port: 6222, IP: "nats-route://10.0.0.1:6222/"}},
+		{description: "unix no advertise advertises nothing", cluster: ClusterOpts{UnixSocket: "/run/nats/a.sock"}, expected: Info{}},
+		{description: "unix with advertise", cluster: ClusterOpts{UnixSocket: "/run/nats/a.sock", Advertise: "unix:///p/a.sock"}, expected: Info{IP: "unix:///p/a.sock"}},
+		{description: "unix with abstract advertise", cluster: ClusterOpts{UnixSocket: "/run/nats/a.sock", Advertise: "unix://@a"}, expected: Info{IP: "unix://@a"}},
+		// negative
+		{description: "unix with invalid advertise", cluster: ClusterOpts{UnixSocket: "/run/nats/a.sock", Advertise: "unix://relative"}, expectedErr: "must be an absolute path"},
+		{description: "tcp with invalid advertise", cluster: ClusterOpts{Host: "127.0.0.1", Port: 6222, Advertise: "10.0.0.1:XXXX"}, expectedErr: "invalid syntax"},
+		// corner
+		{description: "advertise scheme is case-insensitive", cluster: ClusterOpts{UnixSocket: "/run/nats/a.sock", Advertise: "UNIX:///p/a.sock"}, expected: Info{IP: "unix:///p/a.sock"}},
+		{description: "stale values are overwritten", cluster: ClusterOpts{UnixSocket: "/run/nats/a.sock"}, expected: Info{}},
+	} {
+		t.Run(tc.description, func(t *testing.T) {
+			s := &Server{opts: &Options{Cluster: tc.cluster}}
+			// Pretend a previous call left TCP values behind.
+			s.routeInfo = Info{Host: "stale", Port: 1, IP: "nats-route://stale:1/"}
+			err := s.setRouteInfoHostPortAndIP()
+			if tc.expectedErr != _EMPTY_ {
+				if err == nil || !strings.Contains(err.Error(), tc.expectedErr) {
+					t.Fatalf("expected error containing %q, got %v", tc.expectedErr, err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			got := s.routeInfo
+			if got.Host != tc.expected.Host || got.Port != tc.expected.Port || got.IP != tc.expected.IP {
+				t.Fatalf("got Host=%q Port=%d IP=%q, expected Host=%q Port=%d IP=%q",
+					got.Host, got.Port, got.IP, tc.expected.Host, tc.expected.Port, tc.expected.IP)
+			}
+		})
+	}
+}
+
+// TestHasThisRouteConfiguredUnix covers matching a gossiped unix address
+// against the configured routes (design doc §6.8).
+func TestHasThisRouteConfiguredUnix(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		description string
+		routes      []string
+		info        Info
+		expected    bool
+	}{
+		// positive
+		{description: "exact path match", routes: []string{"unix:///run/b.sock"}, info: Info{IP: "unix:///run/b.sock"}, expected: true},
+		{description: "abstract match", routes: []string{"unix://@b"}, info: Info{IP: "unix://@b"}, expected: true},
+		{description: "match among mixed routes", routes: []string{"nats-route://127.0.0.1:6222", "unix:///run/b.sock"}, info: Info{IP: "unix:///run/b.sock"}, expected: true},
+		{description: "tcp info still matches tcp route", routes: []string{"nats-route://127.0.0.1:6222"}, info: Info{Host: "127.0.0.1", Port: 6222}, expected: true},
+		{description: "gossiped scheme case differs", routes: []string{"unix:///run/b.sock"}, info: Info{IP: "UNIX:///run/b.sock"}, expected: true},
+		// negative
+		{description: "path differs by trailing component", routes: []string{"unix:///run/b.sock"}, info: Info{IP: "unix:///run/b.sock2"}, expected: false},
+		{description: "tcp configured, unix info", routes: []string{"nats-route://127.0.0.1:6222"}, info: Info{IP: "unix:///run/b.sock"}, expected: false},
+		{description: "unix configured, tcp info", routes: []string{"unix:///run/b.sock"}, info: Info{Host: "127.0.0.1", Port: 6222, IP: "nats-route://127.0.0.1:6222/"}, expected: false},
+		{description: "empty routes", routes: nil, info: Info{IP: "unix:///run/b.sock"}, expected: false},
+		{description: "invalid gossiped unix address", routes: []string{"unix:///run/b.sock"}, info: Info{IP: "unix://run/b.sock"}, expected: false},
+		// corner
+		{description: "path comparison is case-sensitive", routes: []string{"unix:///run/B.sock"}, info: Info{IP: "unix:///run/b.sock"}, expected: false},
+		{description: "pathname and abstract with the same name differ", routes: []string{"unix:///b"}, info: Info{IP: "unix://@b"}, expected: false},
+		{description: "route with credentials still matches by address", routes: []string{"nats-route://u:p@127.0.0.1:6222", "unix:///run/b.sock"}, info: Info{IP: "unix:///run/b.sock"}, expected: true},
+	} {
+		t.Run(tc.description, func(t *testing.T) {
+			var routes []*url.URL
+			for _, r := range tc.routes {
+				u, err := parseURL(r, "route")
+				if err != nil {
+					t.Fatal(err)
+				}
+				routes = append(routes, u)
+			}
+			s := &Server{opts: &Options{Routes: routes}}
+			if got := s.hasThisRouteConfigured(&tc.info); got != tc.expected {
+				t.Fatalf("hasThisRouteConfigured(%+v) = %v, expected %v", tc.info, got, tc.expected)
+			}
+		})
+	}
+}
+
+// acceptOnce listens on the unix socket at native, accepts one connection,
+// closes it and stops listening. It reports through the returned channel.
+func acceptOnce(t *testing.T, native string) chan struct{} {
+	t.Helper()
+	l, err := net.Listen("unix", native)
+	if err != nil {
+		t.Fatalf("unable to listen on %q: %v", native, err)
+	}
+	accepted := make(chan struct{}, 1)
+	go func() {
+		defer l.Close()
+		c, err := l.Accept()
+		if err != nil {
+			return
+		}
+		c.Close()
+		accepted <- struct{}{}
+	}()
+	t.Cleanup(func() { l.Close() })
+	return accepted
+}
+
+// TestProcessImplicitRouteUnix checks when a gossiped INFO leads to a dial
+// (design doc §6.8).
+func TestProcessImplicitRouteUnix(t *testing.T) {
+	skipIfNoUnixSockets(t)
+
+	for _, tc := range []struct {
+		description string
+		// info builds the gossiped INFO given the server and the peer path.
+		info func(s *Server, peer string) *Info
+		// configured, when true, puts the peer path in the server's routes.
+		configured   bool
+		expectedDial bool
+	}{
+		// positive
+		{
+			description:  "unix IP not configured is dialed",
+			info:         func(s *Server, peer string) *Info { return &Info{ID: "peer", IP: unixSchemePrefix + peer} },
+			expectedDial: true,
+		},
+		// negative
+		{
+			description:  "no address at all is not dialed",
+			info:         func(s *Server, peer string) *Info { return &Info{ID: "peer"} },
+			expectedDial: false,
+		},
+		{
+			description:  "unix IP already configured is left to the explicit route",
+			info:         func(s *Server, peer string) *Info { return &Info{ID: "peer", IP: unixSchemePrefix + peer} },
+			configured:   true,
+			expectedDial: false,
+		},
+		{
+			description:  "own ID is not dialed",
+			info:         func(s *Server, peer string) *Info { return &Info{ID: s.info.ID, IP: unixSchemePrefix + peer} },
+			expectedDial: false,
+		},
+		{
+			description: "own listen path is not dialed",
+			info: func(s *Server, peer string) *Info {
+				return &Info{ID: "peer", IP: unixSchemePrefix + s.getOpts().Cluster.UnixSocket}
+			},
+			expectedDial: false,
+		},
+		{
+			description:  "invalid unix address is not dialed",
+			info:         func(s *Server, peer string) *Info { return &Info{ID: "peer", IP: "unix://relative"} },
+			expectedDial: false,
+		},
+		// corner
+		{
+			description: "auth required still dials with the canonical unix URL",
+			info: func(s *Server, peer string) *Info {
+				return &Info{ID: "peer", IP: unixSchemePrefix + peer, AuthRequired: true}
+			},
+			expectedDial: true,
+		},
+	} {
+		t.Run(tc.description, func(t *testing.T) {
+			o := defaultUnixClusterOptions(t, "a.sock")
+			o.Cluster.Username, o.Cluster.Password = "ruser", "top_secret"
+			peer := tempSocketPath(t, "peer.sock")
+			var accepted chan struct{}
+			var sp *Server
+			if tc.configured {
+				// A real peer, so the explicit route settles and only an
+				// implicit dial would move the counter.
+				op := defaultUnixClusterOptions(t, "unused.sock")
+				op.Cluster.UnixSocket = peer
+				op.Cluster.Username, op.Cluster.Password = "ruser", "top_secret"
+				sp = RunServer(op)
+				defer sp.Shutdown()
+				o.Routes = []*url.URL{unixRouteURL(peer)}
+			} else {
+				accepted = acceptOnce(t, nativeUnixAddr(peer))
+			}
+			s := RunServer(o)
+			defer s.Shutdown()
+			if tc.configured {
+				// Wait for every pooled connection, then for the counter
+				// to stop moving.
+				checkClusterFormed(t, s, sp)
+				var settled uint64
+				checkFor(t, 2*time.Second, 50*time.Millisecond, func() error {
+					if n := s.udsStats.dialed.Load(); n != settled {
+						settled = n
+						return fmt.Errorf("still dialing: %d", n)
+					}
+					return nil
+				})
+			}
+			before := s.udsStats.dialed.Load()
+
+			s.processImplicitRoute(tc.info(s, peer), false)
+
+			if tc.configured {
+				time.Sleep(250 * time.Millisecond)
+				if got := s.udsStats.dialed.Load(); got != before {
+					t.Fatalf("dialed counter moved from %d to %d, expected the configured route to be left alone", before, got)
+				}
+				return
+			}
+			select {
+			case <-accepted:
+				if !tc.expectedDial {
+					t.Fatal("peer was dialed, expected no dial")
+				}
+			case <-time.After(250 * time.Millisecond):
+				if tc.expectedDial {
+					t.Fatalf("peer was not dialed (dialed counter %d -> %d)", before, s.udsStats.dialed.Load())
+				}
+			}
+			if !tc.expectedDial {
+				if got := s.udsStats.dialed.Load(); got != before {
+					t.Fatalf("dialed counter moved from %d to %d, expected no dial", before, got)
+				}
+			}
+		})
+	}
+}
+
+// routeHosts returns the c.host of every route on s, sorted.
+func routeHosts(s *Server) []string {
+	var hosts []string
+	s.mu.RLock()
+	s.forEachRoute(func(r *client) {
+		r.mu.Lock()
+		hosts = append(hosts, r.host)
+		r.mu.Unlock()
+	})
+	s.mu.RUnlock()
+	sort.Strings(hosts)
+	return hosts
+}
+
+// TestRouteUnixDial covers connectToRoute over unix sockets with real
+// listeners (design doc §6.9).
+func TestRouteUnixDial(t *testing.T) {
+	skipIfNoUnixSockets(t)
+
+	t.Run("explicit route to a listening path forms a cluster", func(t *testing.T) {
+		ob := defaultUnixClusterOptions(t, "b.sock")
+		sb := RunServer(ob)
+		defer sb.Shutdown()
+
+		oa := defaultUnixClusterOptions(t, "a.sock")
+		oa.Routes = []*url.URL{unixRouteURL(ob.Cluster.UnixSocket)}
+		sa := RunServer(oa)
+		defer sa.Shutdown()
+
+		checkClusterFormed(t, sa, sb)
+		if n := sa.udsStats.dialed.Load(); n == 0 {
+			t.Fatal("expected the dialed counter to move")
+		}
+		if n := sa.udsStats.dialErrors.Load(); n != 0 {
+			t.Fatalf("dialErrors = %d, expected 0", n)
+		}
+		checkFor(t, 2*time.Second, 10*time.Millisecond, func() error {
+			if n := sb.udsStats.accepted.Load(); n == 0 {
+				return fmt.Errorf("expected the accepted counter to move")
+			}
+			return nil
+		})
+		// The soliciting side knows the peer by its path; the accepting
+		// side sees an unnamed peer.
+		if hosts := routeHosts(sa); len(hosts) == 0 || hosts[0] != nativeUnixAddr(ob.Cluster.UnixSocket) {
+			t.Fatalf("route host on the dialing side = %v, expected %q", hosts, nativeUnixAddr(ob.Cluster.UnixSocket))
+		}
+		for _, h := range routeHosts(sb) {
+			if strings.Contains(h, "b.sock") {
+				t.Fatalf("accepting side route host = %q, expected an unnamed peer", h)
+			}
+		}
+	})
+
+	t.Run("explicit route with cluster authorization", func(t *testing.T) {
+		for _, tc := range []struct {
+			description    string
+			user, pass     string
+			expectedFormed bool
+		}{
+			// positive
+			{description: "matching cluster credentials", user: "ruser", pass: "top_secret", expectedFormed: true},
+			// negative
+			{description: "wrong password on the dialing side", user: "ruser", pass: "wrong", expectedFormed: false},
+			{description: "no credentials on the dialing side", expectedFormed: false},
+		} {
+			t.Run(tc.description, func(t *testing.T) {
+				ob := defaultUnixClusterOptions(t, "b.sock")
+				ob.Cluster.Username, ob.Cluster.Password = "ruser", "top_secret"
+				sb := RunServer(ob)
+				defer sb.Shutdown()
+
+				oa := defaultUnixClusterOptions(t, "a.sock")
+				oa.Cluster.Username, oa.Cluster.Password = tc.user, tc.pass
+				oa.Routes = []*url.URL{unixRouteURL(ob.Cluster.UnixSocket)}
+				sa := RunServer(oa)
+				defer sa.Shutdown()
+
+				if tc.expectedFormed {
+					checkClusterFormed(t, sa, sb)
+					return
+				}
+				time.Sleep(200 * time.Millisecond)
+				if n := sa.NumRoutes(); n != 0 {
+					t.Fatalf("expected no routes with bad credentials, got %d", n)
+				}
+			})
+		}
+	})
+
+	if runtime.GOOS == "linux" {
+		t.Run("explicit route to an abstract socket", func(t *testing.T) {
+			ob := defaultUnixClusterOptions(t, "b.sock")
+			ob.Cluster.UnixSocket = fmt.Sprintf("@nats-uds-%d", time.Now().UnixNano())
+			sb := RunServer(ob)
+			defer sb.Shutdown()
+
+			oa := defaultUnixClusterOptions(t, "a.sock")
+			oa.Routes = []*url.URL{unixRouteURL(ob.Cluster.UnixSocket)}
+			sa := RunServer(oa)
+			defer sa.Shutdown()
+
+			checkClusterFormed(t, sa, sb)
+		})
+	}
+
+	t.Run("explicit route to a missing path keeps retrying until it appears", func(t *testing.T) {
+		peer := tempSocketPath(t, "b.sock")
+		oa := defaultUnixClusterOptions(t, "a.sock")
+		oa.Routes = []*url.URL{unixRouteURL(peer)}
+		sa := RunServer(oa)
+		defer sa.Shutdown()
+
+		checkFor(t, 2*time.Second, 10*time.Millisecond, func() error {
+			if n := sa.udsStats.dialErrors.Load(); n < 2 {
+				return fmt.Errorf("dialErrors = %d, expected retries", n)
+			}
+			return nil
+		})
+		if sa.NumRoutes() != 0 {
+			t.Fatal("expected no route yet")
+		}
+		ob := defaultUnixClusterOptions(t, "unused.sock")
+		ob.Cluster.UnixSocket = peer
+		sb := RunServer(ob)
+		defer sb.Shutdown()
+		checkClusterFormed(t, sa, sb)
+	})
+
+	t.Run("dial error message names the socket", func(t *testing.T) {
+		peer := tempSocketPath(t, "b.sock")
+		oa := defaultUnixClusterOptions(t, "a.sock")
+		oa.Routes = []*url.URL{unixRouteURL(peer)}
+		sa := RunServer(oa)
+		defer sa.Shutdown()
+		l := &captureErrorLogger{errCh: make(chan string, 16)}
+		sa.SetLogger(l, false, false)
+		// Errors are reported on the first attempt, then every so often.
+		checkFor(t, 2*time.Second, 10*time.Millisecond, func() error {
+			if n := sa.udsStats.dialErrors.Load(); n < 1 {
+				return fmt.Errorf("dialErrors = %d", n)
+			}
+			return nil
+		})
+		select {
+		case e := <-l.errCh:
+			if !strings.Contains(e, nativeUnixAddr(peer)) {
+				t.Fatalf("expected the error to name %q, got %q", nativeUnixAddr(peer), e)
+			}
+		case <-time.After(2 * time.Second):
+			// The first attempt may have been logged before the logger was
+			// swapped in; the counter check above is the hard assertion.
+		}
+	})
+
+	t.Run("implicit route gives up after connect_retries", func(t *testing.T) {
+		peer := tempSocketPath(t, "b.sock")
+		for _, tc := range []struct {
+			description      string
+			retries          int
+			expectedAttempts uint64
+		}{
+			// boundary
+			{description: "connect_retries 0 is exactly one attempt", retries: 0, expectedAttempts: 1},
+			{description: "connect_retries 2 is three attempts", retries: 2, expectedAttempts: 3},
+		} {
+			t.Run(tc.description, func(t *testing.T) {
+				oa := defaultUnixClusterOptions(t, "a.sock")
+				oa.Cluster.ConnectRetries = tc.retries
+				sa := RunServer(oa)
+				defer sa.Shutdown()
+				sa.processImplicitRoute(&Info{ID: "peer", IP: unixSchemePrefix + peer}, false)
+				checkFor(t, 2*time.Second, 10*time.Millisecond, func() error {
+					if n := sa.udsStats.dialErrors.Load(); n < tc.expectedAttempts {
+						return fmt.Errorf("dialErrors = %d, expected %d", n, tc.expectedAttempts)
+					}
+					return nil
+				})
+				time.Sleep(100 * time.Millisecond)
+				if n := sa.udsStats.dialErrors.Load(); n != tc.expectedAttempts {
+					t.Fatalf("dialErrors = %d, expected exactly %d", n, tc.expectedAttempts)
+				}
+			})
+		}
+	})
+
+	t.Run("explicit route with connect_backoff keeps retrying", func(t *testing.T) {
+		peer := tempSocketPath(t, "b.sock")
+		oa := defaultUnixClusterOptions(t, "a.sock")
+		oa.Cluster.ConnectBackoff = true
+		oa.Routes = []*url.URL{unixRouteURL(peer)}
+		sa := RunServer(oa)
+		defer sa.Shutdown()
+		checkFor(t, 2*time.Second, 10*time.Millisecond, func() error {
+			if n := sa.udsStats.dialErrors.Load(); n < 3 {
+				return fmt.Errorf("dialErrors = %d, expected continued retries", n)
+			}
+			return nil
+		})
+	})
+
+	t.Run("route removed by reload stops the retry loop", func(t *testing.T) {
+		peer := tempSocketPath(t, "b.sock")
+		oa := defaultUnixClusterOptions(t, "a.sock")
+		oa.Routes = []*url.URL{unixRouteURL(peer)}
+		sa := RunServer(oa)
+		defer sa.Shutdown()
+		checkFor(t, 2*time.Second, 10*time.Millisecond, func() error {
+			if n := sa.udsStats.dialErrors.Load(); n < 1 {
+				return fmt.Errorf("no dial attempt yet")
+			}
+			return nil
+		})
+		noRoutes := *oa
+		noRoutes.Routes = nil
+		if err := sa.ReloadOptions(&noRoutes); err != nil {
+			t.Fatalf("reload failed: %v", err)
+		}
+		if sa.routeStillValid(unixRouteURL(peer)) {
+			t.Fatal("expected the route to no longer be valid")
+		}
+		// Retries stop: the counter settles.
+		var settled uint64
+		checkFor(t, 2*time.Second, 50*time.Millisecond, func() error {
+			n := sa.udsStats.dialErrors.Load()
+			if n != settled {
+				settled = n
+				return fmt.Errorf("still retrying: %d", n)
+			}
+			return nil
+		})
+	})
+
+	t.Run("explicit route to own listen path is skipped", func(t *testing.T) {
+		oa := defaultUnixClusterOptions(t, "a.sock")
+		oa.Routes = []*url.URL{unixRouteURL(oa.Cluster.UnixSocket)}
+		sa := RunServer(oa)
+		defer sa.Shutdown()
+		time.Sleep(100 * time.Millisecond)
+		if n := sa.udsStats.dialed.Load(); n != 0 {
+			t.Fatalf("dialed = %d, expected the self route to be skipped without dialing", n)
+		}
+		if sa.NumRoutes() != 0 {
+			t.Fatal("expected no routes")
+		}
+	})
+
+	t.Run("peer that closes right after accept triggers a reconnect", func(t *testing.T) {
+		peer := tempSocketPath(t, "b.sock")
+		accepted := acceptOnce(t, nativeUnixAddr(peer))
+		oa := defaultUnixClusterOptions(t, "a.sock")
+		oa.Routes = []*url.URL{unixRouteURL(peer)}
+		sa := RunServer(oa)
+		defer sa.Shutdown()
+		select {
+		case <-accepted:
+		case <-time.After(2 * time.Second):
+			t.Fatal("peer was not dialed")
+		}
+		// The listener is gone now, so the reconnects fail and are counted.
+		checkFor(t, 2*time.Second, 10*time.Millisecond, func() error {
+			if n := sa.udsStats.dialed.Load(); n < 2 {
+				return fmt.Errorf("dialed = %d, expected a reconnect attempt", n)
+			}
+			return nil
+		})
+	})
+}
+
+// unixClusterConf renders a configuration file for a server with a unix
+// socket route listener.
+func unixClusterConf(name, socket, advertise string, routes ...string) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "server_name: %s\nlisten: 127.0.0.1:-1\ncluster {\n  name: uds\n  pool_size: -1\n  listen: %q\n", name, unixSchemePrefix+socket)
+	if advertise != _EMPTY_ {
+		fmt.Fprintf(&b, "  advertise: %q\n", advertise)
+	}
+	if len(routes) > 0 {
+		b.WriteString("  routes: [\n")
+		for _, r := range routes {
+			fmt.Fprintf(&b, "    %q,\n", r)
+		}
+		b.WriteString("  ]\n")
+	}
+	b.WriteString("}\n")
+	return b.String()
+}
+
+// TestRouteUnixReload covers adding and removing unix routes, and the
+// rejected listener changes, through a configuration reload (design doc
+// §6.11).
+func TestRouteUnixReload(t *testing.T) {
+	skipIfNoUnixSockets(t)
+
+	ob := defaultUnixClusterOptions(t, "b.sock")
+	ob.Cluster.Name = "uds"
+	ob.Cluster.PoolSize = -1
+	sb := RunServer(ob)
+	defer sb.Shutdown()
+	bRoute := unixSchemePrefix + ob.Cluster.UnixSocket
+
+	aSock := tempSocketPath(t, "a.sock")
+	sa, _, conf := runReloadServerWithContent(t, []byte(unixClusterConf("a", aSock, _EMPTY_)))
+	defer sa.Shutdown()
+	checkNumRoutes(t, sa, 0)
+
+	for _, tc := range []struct {
+		description string
+		conf        string
+		expectedErr string
+		// expectedRoutes is the route count on A after the reload.
+		expectedRoutes int
+		// expectedIP is A's advertised INFO IP after the reload.
+		expectedIP string
+	}{
+		// positive
+		{description: "adding a unix route dials it", conf: unixClusterConf("a", aSock, _EMPTY_, bRoute), expectedRoutes: 1},
+		{description: "same route again is a no-op", conf: unixClusterConf("a", aSock, _EMPTY_, bRoute), expectedRoutes: 1},
+		{description: "adding a unix advertise is accepted and applied", conf: unixClusterConf("a", aSock, "unix:///p/a.sock", bRoute), expectedRoutes: 1, expectedIP: "unix:///p/a.sock"},
+		{description: "changing between unix advertise paths is accepted", conf: unixClusterConf("a", aSock, "unix:///p/a2.sock", bRoute), expectedRoutes: 1, expectedIP: "unix:///p/a2.sock"},
+		{description: "removing the unix route closes it", conf: unixClusterConf("a", aSock, "unix:///p/a2.sock"), expectedRoutes: 0, expectedIP: "unix:///p/a2.sock"},
+		{description: "removing the advertise is accepted", conf: unixClusterConf("a", aSock, _EMPTY_), expectedRoutes: 0},
+		// negative
+		{description: "changing the unix path is rejected", conf: unixClusterConf("a", tempSocketPath(t, "a2.sock"), _EMPTY_), expectedErr: "config reload not supported for cluster unix socket"},
+		{description: "changing listen from unix to tcp is rejected", conf: "server_name: a\nlisten: 127.0.0.1:-1\ncluster { name: uds, pool_size: -1, listen: 127.0.0.1:-1 }\n", expectedErr: "config reload not supported for cluster unix socket"},
+		{description: "tcp advertise on the unix listener is rejected", conf: unixClusterConf("a", aSock, "10.0.0.1:6222"), expectedErr: `advertise transport "tcp" does not match listener transport "unix"`},
+		{description: "invalid unix advertise is rejected", conf: unixClusterConf("a", aSock, "unix://relative"), expectedErr: "must be an absolute path"},
+		{description: "invalid unix route is rejected", conf: unixClusterConf("a", aSock, _EMPTY_, "unix://relative"), expectedErr: "must be an absolute path"},
+	} {
+		t.Run(tc.description, func(t *testing.T) {
+			changeCurrentConfigContentWithNewContent(t, conf, []byte(tc.conf))
+			err := sa.Reload()
+			if tc.expectedErr != _EMPTY_ {
+				if err == nil || !strings.Contains(err.Error(), tc.expectedErr) {
+					t.Fatalf("expected reload error containing %q, got %v", tc.expectedErr, err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected reload error: %v", err)
+			}
+			checkNumRoutes(t, sa, tc.expectedRoutes)
+			if tc.expectedRoutes > 0 {
+				checkClusterFormed(t, sa, sb)
+			}
+			sa.mu.RLock()
+			ip := sa.routeInfo.IP
+			sa.mu.RUnlock()
+			if ip != tc.expectedIP {
+				t.Fatalf("routeInfo.IP = %q, expected %q", ip, tc.expectedIP)
+			}
+		})
+	}
+}
+
+// TestRouteUnixTLS covers TLS on routes over unix sockets, where the URL
+// has no hostname to verify the certificate against (design doc §6.12).
+func TestRouteUnixTLS(t *testing.T) {
+	skipIfNoUnixSockets(t)
+
+	const tlsBlock = `
+  tls {
+    cert_file: "../test/configs/certs/server-cert.pem"
+    key_file: "../test/configs/certs/server-key.pem"
+    ca_file: "../test/configs/certs/ca.pem"
+    timeout: 2
+    %s
+  }`
+	for _, tc := range []struct {
+		description string
+		// extraRoutes are configured on A besides the unix route to B.
+		extraRoutes []string
+		insecure    bool
+		// expectedFormed says whether A and B end up routed.
+		expectedFormed bool
+		expectedErr    string
+	}{
+		// positive
+		{description: "hostname from a configured tcp route is used as ServerName", extraRoutes: []string{"nats-route://localhost:1"}, expectedFormed: true},
+		{description: "insecure skips verification and connects", insecure: true, expectedFormed: true},
+		// negative
+		{description: "no hostname anywhere is a clear error", expectedFormed: false, expectedErr: errRouteTLSUnixNoName.Error()},
+		{description: "ip-only tcp route gives no usable name", extraRoutes: []string{"nats-route://127.0.0.1:1"}, expectedFormed: false, expectedErr: errRouteTLSUnixNoName.Error()},
+	} {
+		t.Run(tc.description, func(t *testing.T) {
+			insecure := _EMPTY_
+			if tc.insecure {
+				insecure = "insecure: true"
+			}
+			bSock := tempSocketPath(t, "b.sock")
+			bConf := unixClusterConf("b", bSock, _EMPTY_)
+			bConf = strings.Replace(bConf, "}\n", fmt.Sprintf(tlsBlock, _EMPTY_)+"\n}\n", 1)
+			ob, _ := newOptionsFromContent(t, []byte(bConf))
+			ob.NoLog = true
+			sb := RunServer(ob)
+			defer sb.Shutdown()
+
+			routes := append([]string{unixSchemePrefix + bSock}, tc.extraRoutes...)
+			aConf := unixClusterConf("a", tempSocketPath(t, "a.sock"), _EMPTY_, routes...)
+			aConf = strings.Replace(aConf, "}\n", fmt.Sprintf(tlsBlock, insecure)+"\n}\n", 1)
+			oa, _ := newOptionsFromContent(t, []byte(aConf))
+			oa.NoLog = true
+			oa.Cluster.resolver = &localhostResolver{}
+			sa, err := NewServer(oa)
+			if err != nil {
+				t.Fatal(err)
+			}
+			l := &captureErrorLogger{errCh: make(chan string, 64)}
+			sa.SetLogger(l, false, false)
+			sa.Start()
+			defer sa.Shutdown()
+
+			if tc.expectedFormed {
+				checkClusterFormed(t, sa, sb)
+				return
+			}
+			var seen string
+			checkFor(t, 3*time.Second, 10*time.Millisecond, func() error {
+				for {
+					select {
+					case e := <-l.errCh:
+						if strings.Contains(e, tc.expectedErr) {
+							seen = e
+							return nil
+						}
+					default:
+						return fmt.Errorf("error containing %q not logged yet", tc.expectedErr)
+					}
+				}
+			})
+			if seen == _EMPTY_ {
+				t.Fatalf("expected an error containing %q", tc.expectedErr)
+			}
+			if sa.NumRoutes() != 0 || sb.NumRoutes() != 0 {
+				t.Fatalf("expected no routes, got %d and %d", sa.NumRoutes(), sb.NumRoutes())
+			}
+		})
+	}
+}
+
+// meshServer is one server in a topology row.
+type meshServer struct {
+	name string
+	// tcp, when true, listens on a random TCP port instead of a unix socket.
+	tcp bool
+	// advertise is a unix advertise address, or empty.
+	advertise string
+	// routes names the servers this one has explicit routes to.
+	routes []string
+}
+
+// runMesh starts the servers of a topology and returns them by name along
+// with the socket paths.
+func runMesh(t *testing.T, servers []meshServer) map[string]*Server {
+	t.Helper()
+	opts := make(map[string]*Options, len(servers))
+	for _, ms := range servers {
+		var o *Options
+		if ms.tcp {
+			o = DefaultOptions()
+		} else {
+			o = defaultUnixClusterOptions(t, ms.name+".sock")
+		}
+		o.ServerName = ms.name
+		o.Cluster.Name = "mesh"
+		o.Cluster.Advertise = ms.advertise
+		opts[ms.name] = o
+	}
+	// TCP servers need their port before others can route to them, so
+	// start them first, then everything else.
+	srvs := make(map[string]*Server, len(servers))
+	for _, ms := range servers {
+		if ms.tcp {
+			srvs[ms.name] = RunServer(opts[ms.name])
+		}
+	}
+	for _, ms := range servers {
+		o := opts[ms.name]
+		for _, peer := range ms.routes {
+			po := opts[peer]
+			if po.Cluster.UnixSocket != _EMPTY_ {
+				o.Routes = append(o.Routes, unixRouteURL(po.Cluster.UnixSocket))
+			} else {
+				o.Routes = append(o.Routes, RoutesFromStr(fmt.Sprintf("nats-route://127.0.0.1:%d", po.Cluster.Port))...)
+			}
+		}
+		if !ms.tcp {
+			srvs[ms.name] = RunServer(o)
+		} else if len(o.Routes) > 0 {
+			// TCP servers were started without routes; add them now.
+			if err := srvs[ms.name].ReloadOptions(o); err != nil {
+				t.Fatalf("unable to add routes to %s: %v", ms.name, err)
+			}
+		}
+	}
+	t.Cleanup(func() {
+		for _, s := range srvs {
+			s.Shutdown()
+		}
+	})
+	return srvs
+}
+
+// checkMeshTraffic publishes on one server and expects delivery on another.
+func checkMeshTraffic(t *testing.T, from, to *Server, subject string) {
+	t.Helper()
+	ncTo, err := nats.Connect(to.ClientURL())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ncTo.Close()
+	sub, err := ncTo.SubscribeSync(subject)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ncTo.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	// Wait for the subscription interest to propagate across the route.
+	checkSubInterest(t, from, globalAccountName, subject, 2*time.Second)
+
+	ncFrom, err := nats.Connect(from.ClientURL())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ncFrom.Close()
+	if err := ncFrom.Publish(subject, []byte("hello")); err != nil {
+		t.Fatal(err)
+	}
+	if err := ncFrom.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sub.NextMsg(2 * time.Second); err != nil {
+		t.Fatalf("message published on %s did not reach %s: %v", from.Name(), to.Name(), err)
+	}
+}
+
+// TestRouteUnixThreeServerMesh runs three servers with unix socket listeners
+// and a full explicit mesh (design doc §7.1).
+func TestRouteUnixThreeServerMesh(t *testing.T) {
+	skipIfNoUnixSockets(t)
+
+	srvs := runMesh(t, []meshServer{
+		{name: "a", routes: []string{"b", "c"}},
+		{name: "b", routes: []string{"a", "c"}},
+		{name: "c", routes: []string{"a", "b"}},
+	})
+	sa, sb, sc := srvs["a"], srvs["b"], srvs["c"]
+	checkClusterFormed(t, sa, sb, sc)
+
+	// The duplicate-route dance (A dials B while B dials A) leaves exactly
+	// one route per pair; checkClusterFormed already asserts the count.
+	checkMeshTraffic(t, sc, sa, "mesh.ca")
+	checkMeshTraffic(t, sa, sb, "mesh.ab")
+	checkMeshTraffic(t, sb, sc, "mesh.bc")
+
+	// Restart B on the same path; the mesh re-forms.
+	ob := sb.getOpts()
+	sb.Shutdown()
+	checkClusterFormed(t, sa, sc)
+	sb = RunServer(ob)
+	defer sb.Shutdown()
+	checkClusterFormed(t, sa, sb, sc)
+	checkMeshTraffic(t, sb, sa, "mesh.ba")
+
+	// No socket files remain after shutdown.
+	paths := []string{sa.getOpts().Cluster.UnixSocket, ob.Cluster.UnixSocket, sc.getOpts().Cluster.UnixSocket}
+	sa.Shutdown()
+	sb.Shutdown()
+	sc.Shutdown()
+	for _, p := range paths {
+		if _, err := os.Lstat(nativeUnixAddr(p)); !os.IsNotExist(err) {
+			t.Fatalf("socket file %q still present after shutdown (err=%v)", p, err)
+		}
+	}
+}
+
+// TestRouteUnixMeshTopologies runs the mesh in several route layouts
+// (design doc §7.1).
+func TestRouteUnixMeshTopologies(t *testing.T) {
+	skipIfNoUnixSockets(t)
+
+	for _, tc := range []struct {
+		description string
+		servers     []meshServer
+	}{
+		{
+			description: "full explicit mesh",
+			servers: []meshServer{
+				{name: "a", routes: []string{"b", "c"}},
+				{name: "b", routes: []string{"a", "c"}},
+				{name: "c", routes: []string{"a", "b"}},
+			},
+		},
+		{
+			description: "ring without advertise, each pair has one explicit route",
+			servers: []meshServer{
+				{name: "a", routes: []string{"b"}},
+				{name: "b", routes: []string{"c"}},
+				{name: "c", routes: []string{"a"}},
+			},
+		},
+		{
+			description: "ring with advertise, gossip adds nothing and no duplicates",
+			servers: []meshServer{
+				{name: "a", routes: []string{"b"}, advertise: "unix:///" + strings.TrimPrefix(tempSocketPath(t, "adv-a.sock"), "/")},
+				{name: "b", routes: []string{"c"}, advertise: "unix:///" + strings.TrimPrefix(tempSocketPath(t, "adv-b.sock"), "/")},
+				{name: "c", routes: []string{"a"}, advertise: "unix:///" + strings.TrimPrefix(tempSocketPath(t, "adv-c.sock"), "/")},
+			},
+		},
+		{
+			description: "star, one server dials the other two",
+			servers: []meshServer{
+				{name: "a", routes: []string{"b", "c"}},
+				{name: "b"},
+				{name: "c", routes: []string{"b"}},
+			},
+		},
+		{
+			description: "mixed transport, a-b over tcp, b-c and c-a over unix",
+			servers: []meshServer{
+				{name: "a", tcp: true},
+				{name: "b", routes: []string{"a", "c"}},
+				{name: "c", routes: []string{"a"}},
+			},
+		},
+	} {
+		t.Run(tc.description, func(t *testing.T) {
+			srvs := runMesh(t, tc.servers)
+			sa, sb, sc := srvs["a"], srvs["b"], srvs["c"]
+			checkClusterFormed(t, sa, sb, sc)
+			checkMeshTraffic(t, sa, sc, "topo.ac")
+			checkMeshTraffic(t, sc, sb, "topo.cb")
+			// Stay formed: gossip must not tear down or duplicate routes.
+			time.Sleep(200 * time.Millisecond)
+			checkClusterFormed(t, sa, sb, sc)
 		})
 	}
 }

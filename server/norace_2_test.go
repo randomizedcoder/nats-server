@@ -3925,3 +3925,102 @@ func TestNoRaceFileStoreWeakCacheGCRecyclesBuf(t *testing.T) {
 		expectNotRecycled(t, arr)
 	})
 }
+
+// TestNoRaceRouteUnixThreeServerMeshTraffic pushes a large number of messages
+// across a full mesh of three servers routed over unix sockets and checks that
+// every message arrives on every other server and that the route stats show
+// the traffic went over the unix transport.
+func TestNoRaceRouteUnixThreeServerMeshTraffic(t *testing.T) {
+	skipIfNoUnixSockets(t)
+
+	const (
+		numMsgs   = 100_000
+		msgSize   = 128
+		subject   = "uds.mesh.traffic"
+		timeout   = 30 * time.Second
+		batchSize = 1000
+	)
+
+	srvs := runMesh(t, []meshServer{
+		{name: "A", routes: []string{"B", "C"}},
+		{name: "B", routes: []string{"A", "C"}},
+		{name: "C", routes: []string{"A", "B"}},
+	})
+	sa, sb, sc := srvs["A"], srvs["B"], srvs["C"]
+	checkClusterFormed(t, sa, sb, sc)
+
+	// One subscriber on each of the two receiving servers.
+	var received [2]atomic.Int64
+	for i, s := range []*Server{sb, sc} {
+		nc, err := nats.Connect(s.ClientURL())
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer nc.Close()
+		counter := &received[i]
+		if _, err := nc.Subscribe(subject, func(_ *nats.Msg) { counter.Add(1) }); err != nil {
+			t.Fatal(err)
+		}
+		if err := nc.Flush(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	checkSubInterest(t, sa, globalAccountName, subject, 2*time.Second)
+
+	ncA, err := nats.Connect(sa.ClientURL())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ncA.Close()
+	payload := bytes.Repeat([]byte("x"), msgSize)
+	start := time.Now()
+	for i := 0; i < numMsgs; i++ {
+		if err := ncA.Publish(subject, payload); err != nil {
+			t.Fatal(err)
+		}
+		if i%batchSize == 0 {
+			if err := ncA.Flush(); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	if err := ncA.Flush(); err != nil {
+		t.Fatal(err)
+	}
+
+	for i, s := range []*Server{sb, sc} {
+		counter := &received[i]
+		checkFor(t, timeout, 50*time.Millisecond, func() error {
+			if n := counter.Load(); n != numMsgs {
+				return fmt.Errorf("%s received %d of %d messages", s.Name(), n, numMsgs)
+			}
+			return nil
+		})
+	}
+	elapsed := time.Since(start)
+	t.Logf("%d messages of %d bytes fanned out to 2 servers over unix routes in %v (%.0f msgs/s)",
+		numMsgs, msgSize, elapsed, float64(numMsgs)/elapsed.Seconds())
+
+	// Every route in the mesh went over a unix socket: each server dialed
+	// its two peers (pool size 3 plus the system account route each) and
+	// accepted the peers' dials, and no stale socket was ever removed.
+	for _, s := range []*Server{sa, sb, sc} {
+		if n := s.udsStats.dialed.Load(); n == 0 {
+			t.Fatalf("%s: expected unix route dials, got none", s.Name())
+		}
+		if n := s.udsStats.accepted.Load(); n == 0 {
+			t.Fatalf("%s: expected accepted unix routes, got none", s.Name())
+		}
+		if n := s.udsStats.staleRemoved.Load(); n != 0 {
+			t.Fatalf("%s: expected no stale socket removals, got %d", s.Name(), n)
+		}
+		s.forEachRoute(func(r *client) {
+			r.mu.Lock()
+			_, isUnix := r.nc.RemoteAddr().(*net.UnixAddr)
+			r.mu.Unlock()
+			if !isUnix {
+				t.Errorf("%s: route %d is not over a unix socket", s.Name(), r.cid)
+			}
+		})
+	}
+}

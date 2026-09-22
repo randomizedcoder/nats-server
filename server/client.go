@@ -6725,11 +6725,23 @@ func (c *client) doTLSHandshake(typ string, solicit bool, url *url.URL, tlsConfi
 		c.Debugf("Starting TLS %s client handshake", typ)
 		if tlsConfig.ServerName == _EMPTY_ {
 			// If the given url is a hostname, use this hostname for the
-			// ServerName. If it is an IP, use the cfg's tlsName. If none
-			// is available, resort to current IP.
+			// ServerName. If it is an IP, or there is none (a unix socket
+			// URL), use the cfg's tlsName. If none is available, resort
+			// to current IP.
 			host = url.Hostname()
-			if tlsName != _EMPTY_ && net.ParseIP(host) != nil {
+			if tlsName != _EMPTY_ && (host == _EMPTY_ || net.ParseIP(host) != nil) {
 				host = tlsName
+			}
+			if host == _EMPTY_ && !tlsConfig.InsecureSkipVerify && isUnixRouteURL(url) {
+				// Certificate verification needs a name and a unix socket
+				// has none. Close like any other handshake failure so a
+				// solicited route is retried; the lock is held on entry
+				// and expected on return.
+				c.Errorf("TLS %s handshake error: %v", typ, errRouteTLSUnixNoName)
+				c.mu.Unlock()
+				c.closeConnection(TLSHandshakeError)
+				c.mu.Lock()
+				return false, ErrConnectionClosed
 			}
 			tlsConfig.ServerName = host
 		}

@@ -92,12 +92,14 @@ Validation rules (all produce a config error with the offending value quoted):
    terminating NUL on every OS and returns `EINVAL` otherwise); an abstract name may
    fill `sun_path` because its `@` stands in for the leading NUL.
 
-Credentials for route authentication use the existing route URL user-info syntax and
-are also accepted on UDS routes: `unix://ruser:top_secret@/run/nats/b.sock` is **not**
-valid (the `@` would collide with the abstract-socket marker). Instead the cluster
-`authorization {}` block is used, exactly as gossiped implicit routes use it today
-(`processImplicitRoute` injects `opts.Cluster.Username/Password`). This is a deliberate
-simplification and is documented.
+Credentials for route authentication cannot be carried in a `unix://` route URL:
+`unix://ruser:top_secret@/run/nats/b.sock` is **not** valid (the `@` would collide with
+the abstract-socket marker). Instead the dialing server's own cluster `authorization {}`
+block is used. Gossiped implicit routes already work this way (`processImplicitRoute`
+injects `opts.Cluster.Username/Password` into the URL), and `sendRouteConnect` applies the
+same fallback for explicit `unix://` routes whose URL has no user-info. TCP routes are
+unchanged: a `nats-route://` URL without user-info still sends no credentials. This is a
+deliberate simplification and is documented.
 
 ### 3.2 Configuration
 

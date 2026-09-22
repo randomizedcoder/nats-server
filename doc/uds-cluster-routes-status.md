@@ -15,8 +15,8 @@ Last updated: 2026-09-22
 | 1 | Address parsing, canonical URL helpers, per-OS files | `[x]` | Committed on `uds-cluster-routes`. |
 | 2 | Options, flags, validation, reload rejection | `[x]` | Committed. |
 | 3 | Listener, stale socket, self-route map, accessors | `[x]` | Committed. |
-| 4 | Dial, gossip, INFO, TLS name fallback | `[~]` | |
-| 5 | Monitoring fields and counters | `[ ]` | |
+| 4 | Dial, gossip, INFO, TLS name fallback | `[x]` | Committed. `sendRouteConnect` cluster-auth fallback added for explicit unix routes. |
+| 5 | Monitoring fields and counters | `[~]` | |
 | 6 | Multi-process configs, script, docs | `[ ]` | |
 | 7 | PR: draft, squash, sign-off, evidence | `[ ]` | |
 
@@ -110,24 +110,25 @@ Tests:
 
 Files: `server/route.go`, `server/client.go`
 
-- [ ] `connectToRoute` unix branch (`dialRouteUnix`, self check, no resolver)
-- [ ] `setRouteInfoHostPortAndIP`: UDS listener gives `Host=""`, `Port=0`, `IP` only when advertise set
-- [ ] `processRouteInfo`: switch on `RemoteAddr().(type)`; no `nats-route://:0/` construction
-- [ ] `processImplicitRoute`: early return when no dialable address; unix path dial when advertised
-- [ ] `hasThisRouteConfigured`: UDS address comparison via `unixAddrFromRouteURL`
-- [ ] `saveRouteTLSName`: skips UDS URLs explicitly
-- [ ] `doTLSHandshake` ServerName fallback and explicit error for UDS with no name
-- [ ] Audit every `c.route.url` dereference for nil on accept-side UDS routes (12 sites, `grep -n "route.url" server/*.go`)
+- [x] `connectToRoute` unix branch (self check against `unixRoutesToSelf`, `natsDialTimeout("unix", ...)`, no resolver, `dialed`/`dialErrors` counters)
+- [x] `setRouteInfoHostPortAndIP`: UDS listener gives `Host=""`, `Port=0`, `IP` only when advertise set
+- [x] `processRouteInfo`: switch on `RemoteAddr().(type)`; no `nats-route://:0/` construction; unix `info.IP` becomes the route URL
+- [x] `processImplicitRoute`: early return when no dialable address; unix path dial when advertised
+- [x] `hasThisRouteConfigured`: UDS address comparison via `unixAddrFromRouteURL`
+- [x] `saveRouteTLSName`: skips UDS URLs explicitly
+- [x] `doTLSHandshake` ServerName fallback and explicit error for UDS with no name (`errRouteTLSUnixNoName`, connection closed so the route retries)
+- [x] Audit every `c.route.url` dereference for nil on accept-side UDS routes (16 sites; all solicit-only, nil-checked, or nil-safe `Redacted()`; the one accept-side site in `processRouteInfo` is nil-checked)
+- [x] `sendRouteConnect`: explicit `unix://` routes without user-info fall back to the dialing server's cluster `authorization {}` credentials (found by `TestProcessImplicitRouteUnix`; §3.1 updated)
 
 Tests:
 
-- [ ] §6.8 `TestRouteInfoUnix`, `TestHasThisRouteConfiguredUnix`, `TestProcessImplicitRouteUnix`
-- [ ] §6.9 `TestRouteUnixDial`
-- [ ] §6.11 `TestRouteUnixReload` add/remove rows
-- [ ] §6.12 `TestRouteUnixTLS`
-- [ ] §7.1 `TestRouteUnixThreeServerMesh`, `TestRouteUnixMeshTopologies`
-- [ ] §7.1 `TestNoRaceRouteUnixThreeServerMeshTraffic` in a `norace_*_test.go`
-- [ ] Full existing route suite passes with `-race`: `go test -race -run 'TestRoute' ./server/`
+- [x] §6.8 `TestRouteInfoUnix`, `TestHasThisRouteConfiguredUnix`, `TestProcessImplicitRouteUnix`
+- [x] §6.9 `TestRouteUnixDial` (explicit, abstract, missing path retry, error text, implicit retry budget, backoff, reload removal, self skip, peer close, cluster authorization good/bad/missing)
+- [x] §6.11 `TestRouteUnixReload` add/remove rows (route add, no-op, advertise add/change/remove, rejections)
+- [x] §6.12 `TestRouteUnixTLS` (hostname from TCP route, insecure, no name, ip-only)
+- [x] §7.1 `TestRouteUnixThreeServerMesh`, `TestRouteUnixMeshTopologies` (full mesh, ring without/with advertise, star, mixed tcp/unix)
+- [x] §7.1 `TestNoRaceRouteUnixThreeServerMeshTraffic` in `server/norace_2_test.go` (100k x 128B fan-out to two peers, all routes over unix)
+- [x] Full existing route suite passes with `-race`: `go test -race -run 'TestRoute|TestUnix|TestCluster' ./server/` (skipping the pre-existing flaky `TestRouteSlowConsumerRecover`, see evidence log)
 
 ## Phase 5: monitoring (§3.3)
 
@@ -196,8 +197,19 @@ $ nats-server -t -c uds-bad.conf     # listen: "unix:///tmp/nats-uds/a.sock" + p
 nats-server: uds-bad.conf:2:3: unix socket listen and host/port are mutually exclusive
 ```
 
+Phase 4 (2026-09-22), no-race fan-out over a three-server unix mesh:
+
+```
+$ go test -count=1 -p=1 ./server -run TestNoRaceRouteUnix -tags=skip_no_race_1_tests -v
+    norace_2_test.go:4001: 100000 messages of 128 bytes fanned out to 2 servers over unix routes in 491.517411ms (203452 msgs/s)
+--- PASS: TestNoRaceRouteUnixThreeServerMeshTraffic (0.58s)
+```
+
 Pre-existing on `main` (`edb1b17a`), not caused by this branch: `TestRouteSlowConsumerRecover`
 fails on this machine (`Expected Slow Consumer routes`, bandwidth-shaping proxy timing).
+`TestClusteredInterestConsumerFilterEdit` (JetStream over TCP routes, hard message-count
+assertions with no retry) failed once in a full `-race` run of `TestRoute|TestUnix|TestCluster`
+and passed 8/8 isolated reruns and a second full run; timing under load, unrelated to transport.
 
 ## Session log
 
@@ -207,3 +219,4 @@ fails on this machine (`Expected Slow Consumer routes`, bandwidth-shaping proxy 
 | 2026-09-22 | Plan validated against code; design doc corrected (json tag, `setBaselineOptions` Host guard, 12 predicate sites, reject `%`, TLS error wording). Phase 1 helpers, per-OS files and tests written; `-race` green; windows vet, wasm/darwin/freebsd builds ok. Committed. | Phase 2: `UnixSocket` option, `listenEnabled()`, parse/validate/reload, predicate sites, tests. |
 | 2026-09-22 | Phase 2 done: `UnixSocket` field, `listenEnabled()` at all 12 sites, parse-time and `validateCluster` transport rules, `routesFromStr` error variant for `-routes`, `overrideCluster` unix branch, reload rejection. Fixed phase-1 length rule (pathname limit is `sun_path`-1, abstract is `sun_path`, matching Go's `SockaddrUnix`). Found the conf lexer accepts unquoted `unix:///...`. `-race` green on config/options/reload sets; `./test` route suite green. Committed. | Phase 3: `listenRouteUnix`, `startRouteAcceptLoop` transport switch, accessors, `unixRoutesToSelf`, real-socket tests. |
 | 2026-09-22 | Phase 3 done: `listenRouteUnix`/`removeStaleUnixSocket` (Lstat, not-a-socket, probe, `isConnRefused`, remove + warn + counter), accept loop transport switch, `udsStats` embedded, `unixRoutesToSelf`, `ClusterUnixAddr`/`ClusterListenAddr`, `formatURL` unix branch with `urlUnixAddr` inverse per OS, `initClient` host from `*net.UnixAddr`. Real-socket tables green under `-race`; route/client/ports regressions and `./test` suites green. Committed. | Phase 4: `setRouteInfoHostPortAndIP`, `connectToRoute` unix dial, `processRouteInfo`/`processImplicitRoute`/`hasThisRouteConfigured`, TLS name fallback, three-server mesh tests. |
+| 2026-09-22 | Phase 4 done: `setRouteInfoHostPortAndIP` transport cases, `connectToRoute` unix dial with self skip and counters, `processRouteInfo`/`processImplicitRoute`/`hasThisRouteConfigured` unix `info.IP` handling, `saveRouteTLSName` skip, `doTLSHandshake` name fallback and `errRouteTLSUnixNoName`, `sendRouteConnect` cluster-auth fallback for explicit unix routes (design gap found by test; §3.1 updated). Dial, reload, TLS, mesh and topology tables plus 100k-message no-race fan-out green; `-race` on route/unix/cluster sets and `./test` suites green; windows vet, wasm/darwin/freebsd builds ok. Committed. | Phase 5: `route.transport`, Varz `UnixSocket`/`UnixSocketStats`, Routez `Transport`/`UnixSocket`, STATSZ `RouteStat.Transport`, `TestRouteUnixMonitoring`, golden TCP `/varz` fragment. |

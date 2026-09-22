@@ -14,6 +14,7 @@
 package server
 
 import (
+	"errors"
 	"fmt"
 	"net"
 	"net/url"
@@ -170,6 +171,10 @@ func isUnixRouteURL(u *url.URL) bool {
 	_, ok := unixAddrFromRouteURL(u)
 	return ok
 }
+
+// errRouteTLSUnixNoName is returned when a TLS route is solicited over a
+// unix socket and there is no name to verify the peer certificate against.
+var errRouteTLSUnixNoName = errors.New("TLS route over unix socket requires cluster.tls.insecure or a configured TCP route hostname")
 
 // unixStaleProbeTimeout bounds the connect used to tell a stale socket file
 // (nothing listening, ECONNREFUSED) from one that is in use.

@@ -504,11 +504,18 @@ func (c *client) processInboundRoutedMsg(msg []byte) {
 // Lock should be held entering here.
 func (c *client) sendRouteConnect(clusterName string, tlsRequired bool) error {
 	var user, pass string
+	s := c.srv
 	if userInfo := c.route.url.User; userInfo != nil {
 		user = userInfo.Username()
 		pass, _ = userInfo.Password()
+	} else if isUnixRouteURL(c.route.url) {
+		// A unix:// route URL cannot carry credentials ("@" marks an
+		// abstract socket), so an explicit unix route authenticates with
+		// this server's own cluster authorization, the same credentials
+		// gossiped implicit routes use.
+		opts := s.getOpts()
+		user, pass = opts.Cluster.Username, opts.Cluster.Password
 	}
-	s := c.srv
 	cinfo := connectInfo{
 		Echo:     true,
 		Verbose:  false,
@@ -843,30 +850,52 @@ func (c *client) processRouteInfo(info *Info) {
 	c.opts.Export = info.Export
 
 	// If we do not know this route's URL, construct one on the fly
-	// from the information provided.
+	// from the information provided. A unix socket listener advertises
+	// nothing unless cluster.advertise is set, in which case IP carries
+	// its unix:// URL; without an address the URL stays nil, which the
+	// pool and duplicate handling tolerate for a non-solicited route.
 	if c.route.url == nil {
-		// Add in the URL from host and port
-		hp := net.JoinHostPort(info.Host, strconv.Itoa(info.Port))
-		url, err := url.Parse(fmt.Sprintf("nats-route://%s/", hp))
-		if err != nil {
-			c.Errorf("Error parsing URL from INFO: %v\n", err)
-			c.mu.Unlock()
-			c.closeConnection(ParseError)
-			return
+		if hasUnixScheme(info.IP) {
+			addr, err := parseUnixAddr(info.IP)
+			if err != nil {
+				c.Errorf("Error parsing URL from INFO: %v\n", err)
+				c.mu.Unlock()
+				c.closeConnection(ParseError)
+				return
+			}
+			c.route.url = unixRouteURL(addr)
+		} else if info.Host != _EMPTY_ || info.Port != 0 {
+			// Add in the URL from host and port
+			hp := net.JoinHostPort(info.Host, strconv.Itoa(info.Port))
+			url, err := url.Parse(fmt.Sprintf("nats-route://%s/", hp))
+			if err != nil {
+				c.Errorf("Error parsing URL from INFO: %v\n", err)
+				c.mu.Unlock()
+				c.closeConnection(ParseError)
+				return
+			}
+			c.route.url = url
 		}
-		c.route.url = url
 	}
 	// The incoming INFO from the route will have IP set
 	// if it has Cluster.Advertise. In that case, use that
 	// otherwise construct it from the remote TCP address.
 	if info.IP == _EMPTY_ {
-		// Need to get the remote IP address.
+		// Need to get the remote IP address. A TLS connection may wrap a
+		// unix socket, so look at the address rather than the wrapper.
+		var tcpAddr *net.TCPAddr
 		switch conn := c.nc.(type) {
 		case *net.TCPConn, *tls.Conn:
-			addr := conn.RemoteAddr().(*net.TCPAddr)
-			info.IP = fmt.Sprintf("nats-route://%s/", net.JoinHostPort(addr.IP.String(),
+			tcpAddr, _ = conn.RemoteAddr().(*net.TCPAddr)
+		}
+		if tcpAddr != nil {
+			info.IP = fmt.Sprintf("nats-route://%s/", net.JoinHostPort(tcpAddr.IP.String(),
 				strconv.Itoa(info.Port)))
-		default:
+		} else if addr, ok := unixAddrFromRouteURL(c.route.url); ok {
+			// We dialed this unix socket: gossip the address without
+			// any credentials that the configured route URL may carry.
+			info.IP = unixRouteURL(addr).String()
+		} else if c.route.url != nil {
 			info.IP = c.route.url.String()
 		}
 	}
@@ -1081,12 +1110,30 @@ func (s *Server) processImplicitRoute(info *Info, routeNoPool bool) {
 	if s.hasThisRouteConfigured(info) {
 		return
 	}
+	// A server listening on a unix socket without cluster.advertise has
+	// no address we could dial; its routes have to be explicit.
+	if info.IP == _EMPTY_ && info.Host == _EMPTY_ && info.Port == 0 {
+		return
+	}
 
 	// Initiate the connection, using info.IP instead of info.URL here...
-	r, err := url.Parse(info.IP)
-	if err != nil {
-		s.Errorf("Error parsing URL from INFO: %v\n", err)
-		return
+	var r *url.URL
+	if hasUnixScheme(info.IP) {
+		// Keep the canonical form: url.Parse would put an abstract
+		// name in Host, and credentials added below would then hide it.
+		addr, err := parseUnixAddr(info.IP)
+		if err != nil {
+			s.Errorf("Error parsing URL from INFO: %v\n", err)
+			return
+		}
+		r = unixRouteURL(addr)
+	} else {
+		var err error
+		r, err = url.Parse(info.IP)
+		if err != nil {
+			s.Errorf("Error parsing URL from INFO: %v\n", err)
+			return
+		}
 	}
 
 	if info.AuthRequired {
@@ -1113,6 +1160,20 @@ func (s *Server) processImplicitRoute(info *Info, routeNoPool bool) {
 func (s *Server) hasThisRouteConfigured(info *Info) bool {
 	routes := s.getOpts().Routes
 	if len(routes) == 0 {
+		return false
+	}
+	// A unix socket address is compared as a whole, case-sensitively:
+	// paths are case-sensitive on Linux and a sun_path is a byte string.
+	if hasUnixScheme(info.IP) {
+		addr, err := parseUnixAddr(info.IP)
+		if err != nil {
+			return false
+		}
+		for _, ri := range routes {
+			if ra, ok := unixAddrFromRouteURL(ri); ok && ra == addr {
+				return true
+			}
+		}
 		return false
 	}
 	// This could possibly be a 0.0.0.0 host so we will also construct a second
@@ -2891,18 +2952,35 @@ func (s *Server) startRouteAcceptLoop() {
 // Similar to setInfoHostPortAndGenerateJSON, but for routeInfo.
 func (s *Server) setRouteInfoHostPortAndIP() error {
 	opts := s.getOpts()
-	if opts.Cluster.Advertise != _EMPTY_ {
-		advHost, advPort, err := parseHostPort(opts.Cluster.Advertise, opts.Cluster.Port)
+	switch adv := opts.Cluster.Advertise; {
+	case hasUnixScheme(adv):
+		// Peers are told to dial this unix socket; there is no host:port.
+		addr, err := parseUnixAddr(adv)
+		if err != nil {
+			return err
+		}
+		s.routeInfo.Host = _EMPTY_
+		s.routeInfo.Port = 0
+		s.routeInfo.IP = unixRouteURL(addr).String()
+	case adv != _EMPTY_:
+		advHost, advPort, err := parseHostPort(adv, opts.Cluster.Port)
 		if err != nil {
 			return err
 		}
 		s.routeInfo.Host = advHost
 		s.routeInfo.Port = advPort
 		s.routeInfo.IP = fmt.Sprintf("nats-route://%s/", net.JoinHostPort(advHost, strconv.Itoa(advPort)))
-	} else {
+	case opts.Cluster.UnixSocket != _EMPTY_:
+		// A unix socket path is only meaningful on this host, so nothing
+		// is advertised: peers learn about this server but do not dial
+		// it unless they have an explicit route.
+		s.routeInfo.Host = _EMPTY_
+		s.routeInfo.Port = 0
+		s.routeInfo.IP = _EMPTY_
+	default:
 		s.routeInfo.Host = opts.Cluster.Host
 		s.routeInfo.Port = opts.Cluster.Port
-		s.routeInfo.IP = ""
+		s.routeInfo.IP = _EMPTY_
 	}
 	return nil
 }
@@ -2967,7 +3045,17 @@ func (s *Server) connectToRoute(rURL *url.URL, rtype RouteType, firstConnect boo
 	s.mu.RLock()
 	resolver := s.routeResolver
 	excludedAddresses := s.routesToSelf
+	excludedUnixAddresses := s.unixRoutesToSelf
 	s.mu.RUnlock()
+
+	// A unix socket route is dialed by path; there is no name to resolve.
+	unixAddr, isUnix := unixAddrFromRouteURL(rURL)
+	if isUnix {
+		if _, self := excludedUnixAddresses[unixAddr]; self {
+			s.Debugf("Not attempting to connect to route %q, it is this server's own unix socket", rURL.Redacted())
+			return
+		}
+	}
 
 	attemptDelay := routeConnectDelay
 	reconnectTimer := time.NewTimer(attemptDelay)
@@ -2991,14 +3079,25 @@ func (s *Server) connectToRoute(rURL *url.URL, rtype RouteType, firstConnect boo
 			}
 		}
 		var conn net.Conn
-		address, err := s.getRandomIP(resolver, rURL.Host, excludedAddresses)
-		if err == errNoIPAvail {
-			// This is ok, we are done.
-			return
-		}
-		if err == nil {
-			s.Debugf("Trying to connect to route on %s (%s)", rURL.Host, address)
-			conn, err = natsDialTimeout("tcp", address, DEFAULT_ROUTE_DIAL)
+		var err error
+		if isUnix {
+			s.Debugf("Trying to connect to route on unix socket %s%s", unixSchemePrefix, unixAddr)
+			s.udsStats.dialed.Add(1)
+			conn, err = natsDialTimeout("unix", nativeUnixAddr(unixAddr), DEFAULT_ROUTE_DIAL)
+			if err != nil {
+				s.udsStats.dialErrors.Add(1)
+			}
+		} else {
+			var address string
+			address, err = s.getRandomIP(resolver, rURL.Host, excludedAddresses)
+			if err == errNoIPAvail {
+				// This is ok, we are done.
+				return
+			}
+			if err == nil {
+				s.Debugf("Trying to connect to route on %s (%s)", rURL.Host, address)
+				conn, err = natsDialTimeout("tcp", address, DEFAULT_ROUTE_DIAL)
+			}
 		}
 		if err != nil {
 			attempts++
@@ -3054,6 +3153,10 @@ func (c *client) isSolicitedRoute() bool {
 // Lock is held on entry
 func (s *Server) saveRouteTLSName(routes []*url.URL) {
 	for _, u := range routes {
+		// A unix socket URL has no hostname to verify a certificate with.
+		if isUnixRouteURL(u) {
+			continue
+		}
 		if s.routeTLSName == _EMPTY_ && net.ParseIP(u.Hostname()) == nil {
 			s.routeTLSName = u.Hostname()
 		}
