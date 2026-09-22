@@ -682,7 +682,9 @@ transport where A↔B is TCP and B↔C, C↔A are UDS.
 Purpose: prove the feature with real processes, and be the harness later reused with the
 RDMA proxy. Shape follows the containerd PR's evidence-driven test section.
 
-Config files `test/configs/uds/srv_{a,b,c}.conf`:
+Config files `test/configs/uds/srv_{a,b,c}.conf` (full mesh) and
+`srv_{a,b,c}_pairs.conf` (ring through a proxy, §7.3). The socket directory is
+`/tmp/nats-uds`; the script rewrites copies when `UDS_DIR` points elsewhere.
 
 ```hcl
 # Cluster Server A
@@ -698,23 +700,27 @@ no_sys_acc: true
 ```
 
 Script steps (bash, `set -euo pipefail`, no external deps beyond `curl`, `ss`, and the
-`nats` CLI which is fetched via `nix shell nixpkgs#natscli` when missing):
+`nats` CLI which is run via `nix shell nixpkgs#natscli -c nats` when missing from `PATH`;
+`socat` only for `UDS_PAIRS=1`). Environment: `UDS_PAIRS`, `UDS_PROXY`, `UDS_DIR`, `OUT`,
+`NATS_CLI`, `BENCH_MSGS`, `TIMEOUT`.
 
 1. `go build -o "$OUT/nats-server" .` and print `nats-server --version`.
 2. `nats-server -t -c` each config.
 3. Start A, B, C in the background with `-l "$OUT/<name>.log"`; record PIDs.
-4. Wait up to 10 s until each `/routez` reports `num_routes == 2` and every route has
-   `"transport":"unix"`.
+4. Wait up to 10 s until each `/routez` lists two distinct `remote_name` peers and every
+   route has `"transport":"unix"`. `num_routes` itself is `2 * pool_size` (6 with the
+   default pool of 3), so the peer count is the mesh criterion, not `num_routes`.
 5. Evidence: `ss -xlp | grep nats-uds` shows three `LISTEN` sockets; `ss -xp | grep
-   nats-uds` shows the established pairs owned by the `nats-server` PIDs; `/varz` shows
-   `unix_socket_stats`.
-6. Traffic: `nats sub` on A, `nats pub` on C, assert delivery; `nats bench` for a
-   throughput number to paste into the PR.
-7. Kill B with `SIGKILL` so its socket file is left behind, restart it, wait for
-   `num_routes == 2` again and grep the log for `Removed stale route unix socket`.
-8. `SIGTERM` all three, assert `/tmp/nats-uds` contains no `.sock` files.
-9. Print a PASS/FAIL summary; exit non-zero on any failure. Logs stay in `$OUT` for the
-   PR description.
+   nats-uds` shows the established pairs owned by the `nats-server` PIDs (the accepting
+   end carries the path, so one line per connection); `/varz` shows `unix_socket_stats`.
+6. Traffic: `nats sub` on A, `nats pub` on C, assert delivery; `nats bench sub` on B with
+   `nats bench pub` on A for a throughput number to paste into the PR.
+7. Kill B with `SIGKILL` so its socket file is left behind, restart it, wait for the mesh
+   again, grep the log for `Removed stale unix socket` and check `/varz` reports
+   `stale_removed: 1`.
+8. `SIGTERM` all three, assert `/tmp/nats-uds` contains no `{a,b,c}.sock` files.
+9. Print a PASS/FAIL summary; exit non-zero on any failure. Logs, raw `/routez` and `/varz`
+   bodies and `ss` output stay in `$OUT` for the PR description.
 
 ### 7.3 Proxied topology (manual, with `uds-over-rdma-proxy`)
 
@@ -731,9 +737,11 @@ proxy pairs:  ab.sock -> b.sock,  bc.sock -> c.sock,  ca.sock -> a.sock
 
 Because no server advertises, the mesh is formed purely by the three explicit routes,
 which is exactly what §7.1's ring topology row asserts in-process. On a single machine
-the proxy can be replaced by `socat UNIX-LISTEN:ab.sock,fork UNIX-CONNECT:b.sock` for a
-dry run; the acceptance evidence is the same `ss -xp` output showing the proxy, not the
-peer server, on the far end of each NATS socket.
+the script starts `socat UNIX-LISTEN:ab.sock,fork UNIX-CONNECT:b.sock` for each pair as a
+dry run; with `UDS_PROXY=1` it starts no proxy and expects `ab/bc/ca.sock` to be served
+by the real `uds-over-rdma-proxy`. The acceptance evidence is the same `ss -xp` output
+showing the proxy, not the peer server, on the far end of each NATS socket, and the
+script asserts that `socat` appears there in the dry run.
 
 ### 7.4 CI
 
@@ -784,3 +792,6 @@ peer server, on the far end of each NATS socket.
 - Optional `unix_socket_mode` for the listener; today directory permissions are the control.
 - Dual TCP + UDS route listeners once "Multiple listen endpoints" lands.
 - Route authentication credentials inside `unix://` URLs, if maintainers want URL parity.
+- `nats-io/nats.docs`: document `unix://` for `cluster.listen`, `cluster.routes`,
+  `cluster.advertise` and the new `/varz` and `/routez` fields (docs live outside this repo;
+  this repo carries `test/configs/uds/README.md`).

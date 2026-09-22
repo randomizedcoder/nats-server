@@ -16,8 +16,8 @@ Last updated: 2026-09-22
 | 2 | Options, flags, validation, reload rejection | `[x]` | Committed. |
 | 3 | Listener, stale socket, self-route map, accessors | `[x]` | Committed. |
 | 4 | Dial, gossip, INFO, TLS name fallback | `[x]` | Committed. `sendRouteConnect` cluster-auth fallback added for explicit unix routes. |
-| 5 | Monitoring fields and counters | `[x]` | Committed. Stopped here for review before phases 6-7. |
-| 6 | Multi-process configs, script, docs | `[ ]` | |
+| 5 | Monitoring fields and counters | `[x]` | Committed. `dialed` counts successes only; `cluster.urls` renders unix routes. |
+| 6 | Multi-process configs, script, docs | `[x]` | Committed. Script passes in full-mesh and `UDS_PAIRS=1` (socat) modes. Real-proxy run still manual. |
 | 7 | PR: draft, squash, sign-off, evidence | `[ ]` | |
 
 Branch: `uds-cluster-routes` (from `main` at `edb1b17a`)
@@ -151,15 +151,15 @@ Tests:
 
 Files: `test/configs/uds/srv_{a,b,c}.conf`, `scripts/uds-cluster-smoke.sh`, docs
 
-- [ ] Three config files
-- [ ] Script: build, config-check, start, wait for `num_routes == 2` and `transport == "unix"`
-- [ ] Script: `ss -xlp` / `ss -xp` evidence capture
-- [ ] Script: pub/sub and `nats bench` traffic
-- [ ] Script: SIGKILL B, restart, stale-socket log line, mesh re-forms
-- [ ] Script: SIGTERM all, assert no `.sock` files remain
-- [ ] `UDS_PAIRS=1` mode with `socat` stand-in for the proxy
-- [ ] Run against the real `uds-over-rdma-proxy` (manual); paste evidence below
-- [ ] Config reference / README mention of `unix://` listen and routes
+- [x] Three config files (`srv_{a,b,c}.conf`), plus `srv_{a,b,c}_pairs.conf` for the ring
+- [x] Script: build, config-check, start, wait for two peers per server and every route `transport == "unix"` (`num_routes` is `2 * pool_size`, 6 by default)
+- [x] Script: `ss -xlp` / `ss -xp` evidence capture (saved under `$OUT`)
+- [x] Script: pub/sub and `nats bench` traffic
+- [x] Script: SIGKILL B, restart, `Removed stale unix socket` log line, `stale_removed: 1` in `/varz`, mesh re-forms
+- [x] Script: SIGTERM all, assert no `{a,b,c}.sock` files remain
+- [x] `UDS_PAIRS=1` mode with `socat` stand-in for the proxy; `UDS_PROXY=1` skips socat for the real proxy
+- [ ] Run against the real `uds-over-rdma-proxy` (manual, `UDS_PAIRS=1 UDS_PROXY=1`); paste evidence below
+- [x] `test/configs/uds/README.md` documents `unix://` listen and routes; `nats.docs` update recorded as a follow-up (design §11)
 
 ## Phase 7: PR
 
@@ -245,6 +245,33 @@ no-race fan-out; 3/3 isolated reruns and a solo rerun of the full suite passed.
 Phase 5 (2026-09-22), `golangci-lint run --config=.golangci.yml ./server/...`: clean after
 fixing one `misspell` finding in a test comment.
 
+Phase 6 (2026-09-22), `scripts/uds-cluster-smoke.sh`, full mesh, five consecutive runs
+`passed: 15 failed: 0`. Key lines from one run:
+
+```
+PASS: mesh formed: every server sees 2 peers, all routes transport unix
+u_str LISTEN 0 4096 /tmp/nats-uds/a.sock ... users:(("nats-server",pid=375342,fd=8))
+u_str LISTEN 0 4096 /tmp/nats-uds/c.sock ... users:(("nats-server",pid=375363,fd=8))
+u_str LISTEN 0 4096 /tmp/nats-uds/b.sock ... users:(("nats-server",pid=375353,fd=8))
+PASS: ss -xlp shows 3 nats-server unix listeners      (ss -xp: 9 ESTAB, 3 pairs x pool 3)
+routez a (num_routes peers unix): 6 2 6               (same for b and c)
+PASS: message published on C was delivered to the subscriber on A
+NATS Core NATS subscriber stats: 507,220 msgs/sec ~ 62 MiB/sec   (100k x 128 B, A -> B)
+PASS: b.sock left behind after SIGKILL
+PASS: restarted b logged stale socket removal: Removed stale unix socket "/tmp/nats-uds/b.sock"
+    "unix_socket_stats": { "accepted": 0, "dialed": 6, "dial_errors": 0, "stale_removed": 1, "active": 6 }
+PASS: no server socket files remain in /tmp/nats-uds after SIGTERM
+```
+
+Phase 6 (2026-09-22), `UDS_PAIRS=1` ring through three `socat` pairs: `passed: 16 failed: 0`.
+`ss -xlp` shows `ab/bc/ca.sock` owned by `socat` and `a/b/c.sock` by `nats-server`; `ss -xp`
+shows every established route socket with `socat` on the far end, never a peer server.
+Bench through the proxy: `466,308 msgs/sec ~ 57 MiB/sec`. B's SIGKILL/restart re-forms the ring.
+
+Script bug found while writing it: the evidence helper teed into the same file `cat` was
+reading, truncating it first, so `/varz` checks failed at random. Fixed by displaying saved
+files without re-teeing. Not a server bug.
+
 ## Session log
 
 | Date | Work done | Next |
@@ -255,3 +282,4 @@ fixing one `misspell` finding in a test comment.
 | 2026-09-22 | Phase 3 done: `listenRouteUnix`/`removeStaleUnixSocket` (Lstat, not-a-socket, probe, `isConnRefused`, remove + warn + counter), accept loop transport switch, `udsStats` embedded, `unixRoutesToSelf`, `ClusterUnixAddr`/`ClusterListenAddr`, `formatURL` unix branch with `urlUnixAddr` inverse per OS, `initClient` host from `*net.UnixAddr`. Real-socket tables green under `-race`; route/client/ports regressions and `./test` suites green. Committed. | Phase 4: `setRouteInfoHostPortAndIP`, `connectToRoute` unix dial, `processRouteInfo`/`processImplicitRoute`/`hasThisRouteConfigured`, TLS name fallback, three-server mesh tests. |
 | 2026-09-22 | Phase 4 done: `setRouteInfoHostPortAndIP` transport cases, `connectToRoute` unix dial with self skip and counters, `processRouteInfo`/`processImplicitRoute`/`hasThisRouteConfigured` unix `info.IP` handling, `saveRouteTLSName` skip, `doTLSHandshake` name fallback and `errRouteTLSUnixNoName`, `sendRouteConnect` cluster-auth fallback for explicit unix routes (design gap found by test; §3.1 updated). Dial, reload, TLS, mesh and topology tables plus 100k-message no-race fan-out green; `-race` on route/unix/cluster sets and `./test` suites green; windows vet, wasm/darwin/freebsd builds ok. Committed. | Phase 5: `route.transport`, Varz `UnixSocket`/`UnixSocketStats`, Routez `Transport`/`UnixSocket`, STATSZ `RouteStat.Transport`, `TestRouteUnixMonitoring`, golden TCP `/varz` fragment. |
 | 2026-09-22 | Phase 5 done: `route.transport` captured at creation, `RouteUnixSocketStats` and `ClusterOptsVarz.UnixSocket`/`UnixSocketStats` (nil for TCP-only servers, golden test), `RouteInfo.Transport`/`UnixSocket` with nil-safe `Routez` address switch, `RouteStat.Transport` in STATSZ. Fixed `dialed` to count successes only (design §3.3). `/varz` `cluster.urls` now renders unix routes (found by the three-process smoke). Monitoring tables over HTTP and API green under `-race`; monitor/varz/routez/events regressions, `./test` suites, cross builds and golangci-lint checked. Committed. Stopped for review. | Review phases 1-5; then phase 6 (multi-process configs, `scripts/uds-cluster-smoke.sh`, `ss -xp` evidence) and phase 7 (issue, draft PR). |
+| 2026-09-22 | Phase 6 done: `test/configs/uds/srv_{a,b,c}.conf` and `srv_{a,b,c}_pairs.conf`, `scripts/uds-cluster-smoke.sh` (build, `-t`, start, wait for two unix peers per server, `ss -xlp`/`ss -xp` evidence, pub/sub, `nats bench`, SIGKILL/restart with stale-socket check, SIGTERM with no leftover sockets, PASS/FAIL summary), `UDS_PAIRS=1` socat ring and `UDS_PROXY=1` hook for the real proxy, `test/configs/uds/README.md`. Design §7.2/§7.3 updated to the shipped script (peer-count criterion, real log text). Five full-mesh runs and one ring run green. Committed. | Dave: run `UDS_PAIRS=1 UDS_PROXY=1 scripts/uds-cluster-smoke.sh` against `uds-over-rdma-proxy` and paste evidence; write the GitHub issue; then phase 7 (rebase, draft PR with hand-written description). |
