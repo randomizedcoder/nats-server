@@ -12,6 +12,52 @@ over Unix domain sockets instead of TCP, so that a cluster can be run on top of 
 UDS-over-RDMA tunnel (the "half kernel bypass" `uds-over-rdma-proxy`) for lower latency
 and higher throughput than the host TCP stack.
 
+### 1.1 Motivation
+
+The RDMA tunnel is the reason this work started, but it is one instance of a more general
+need. Reasons, roughly in the order a maintainer is likely to weigh them:
+
+1. **Attack-surface reduction.** A route listener today is always a TCP port. Over a Unix
+   socket the route endpoint has no port and is unreachable from any network; who may connect
+   is governed by directory permissions and mount namespaces. Cluster credentials and TLS stay
+   available, but they stop being the only fence. `nats-io/nats-server#1216` (monitoring over
+   a socket file, open since 2019) and the reverse-proxy note in `#7800` ask for the same
+   property on other listeners.
+2. **Co-located containers without networking.** Servers in one Kubernetes pod, or Docker
+   containers sharing a volume, form the mesh through a shared socket directory: no bridge
+   networks, no port allocation, no CNI or service-mesh sidecar on the route path, and no mTLS
+   proxy hop for traffic the cluster can already encrypt itself. Pod IPs change on restart; a
+   socket path does not.
+3. **A pluggable transport boundary.** Anything that presents a Unix socket can carry routes
+   with no server change: the RDMA tunnel (measured at ~1.6x a single TCP flow and ~98% of a
+   25 GbE link in its own repo), `socat`, ssh forwarding, vsock bridges between VMs and host,
+   QUIC or SPIFFE mTLS sidecars, systemd socket units. The server only ever sees `AF_UNIX`.
+4. **Same-host efficiency.** Loopback TCP still pays checksum, segmentation, ACK timing and
+   conntrack. Unix sockets are the cheaper path for co-located servers (development clusters,
+   embedded supervisors, single-node "HA in a box").
+5. **Test hygiene.** Fixed-port collisions cost real time in this repository's own suite (see
+   the CI shard aborts in the status doc evidence log). Socket-addressed routes need no ports.
+6. **Ecosystem parity.** Docker, containerd, gRPC, systemd, PostgreSQL, Redis, MySQL, Envoy,
+   HAProxy and Redpanda all offer Unix socket listeners with the `unix://` grammar used here.
+   Go's `net` package supports `AF_UNIX` on Linux, macOS, the BSDs and Windows 10 1803+, so no
+   platform code beyond path normalisation is needed.
+
+Stated limits, so the proposal does not read as open-ended: routes only (clients, leafnodes,
+gateways, MQTT and websocket are follow-ups, §11); a Unix listener is not advertised by
+default, so unix-only servers list every peer explicitly (§4.4); mixed old/new clusters degrade
+to the explicit routes with one error line per gossiped unix-only peer on old servers (§4.4.1);
+TLS over a Unix route needs `insecure` or a TCP hostname among the routes (§4.6); Windows has
+compile and unit coverage until CI runs it.
+
+### 1.2 Prior art in this repository
+
+| Reference | What happened | Lesson for this proposal |
+|---|---|---|
+| PR `#7800` "Add Unix socket support for client listener" (Feb 2026) | `host: /var/run/nats.sock` syntax, no issue first, no evidence; no maintainer comment; auto-closed stale 2026-09-18. | Open the issue first; use an unambiguous `unix://` scheme; attach evidence. |
+| Discussion `#7677` "[UNIX sockets] Extending NATS to become a backbone communication channel" (Dec 2025) | Derek Collison: "Some compelling use cases here." Neil Alexander: worried the scope "grows arms and legs" (peer-credential auth modes, header rewriting) with ongoing maintenance cost. Author closed it. | Keep the scope to transport only: no auth-model change, no new dependency, TCP path byte-identical (golden `/varz` test). |
+| Issue `#1216` "Allow Bind Monitoring HTTP Server to bind to socket file" (Dec 2019, open) | Docker security motivation; no maintainer reply. | Same motivation as item 1; link it. |
+| `containerd/containerd#13569` | The `unix:///path` and `unix://@abstract` grammar, per-OS `nativeUnixAddr`, `sun_path` length check, table-driven tests, `ss -xp` evidence. | Reused here (§3.1, §4.1). |
+
 In scope:
 
 - A route **listener** on a UDS (pathname socket everywhere, Linux abstract socket
@@ -766,9 +812,13 @@ Because no server advertises, the mesh is formed purely by the three explicit ro
 which is exactly what §7.1's ring topology row asserts in-process. On a single machine
 the script starts `socat UNIX-LISTEN:ab.sock,fork UNIX-CONNECT:b.sock` for each pair as a
 dry run; with `UDS_PROXY=1` it starts no proxy and expects `ab/bc/ca.sock` to be served
-by the real `uds-over-rdma-proxy`. The acceptance evidence is the same `ss -xp` output
-showing the proxy, not the peer server, on the far end of each NATS socket, and the
-script asserts that `socat` appears there in the dry run.
+by the real `uds-over-rdma-proxy`. In the dry run the acceptance evidence is `ss -xp`
+showing `socat`, not the peer server, on the far end of each NATS socket. The real proxy
+is a kernel module, so no process appears in `ss -xp`; the script skips that check when
+`UDS_PROXY=1` and instead runs `UDS_PROXY_STATS` (for example `urp stats`) before and after
+the bench, so the proxy's own byte counters are the evidence. The step-by-step runbook for
+the single-host soft-RoCE run and the three-host RoCEv2 run is in the status doc under
+"Real-proxy test runbook".
 
 ### 7.4 CI
 

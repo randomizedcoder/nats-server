@@ -64,3 +64,23 @@ Needs `go`, `curl`, `ss` and the `nats` CLI (run through
 `nix shell nixpkgs#natscli` when absent); `socat` for `UDS_PAIRS=1`. Logs, raw
 monitoring bodies and `ss` output are written to `$OUT` (a `mktemp` directory
 by default) for pasting into a PR.
+
+## Running against a real proxy
+
+With `UDS_PROXY=1` the script starts no `socat`; something else must already
+serve `ab.sock`, `bc.sock` and `ca.sock` in `UDS_DIR` and forward each to
+`b.sock`, `c.sock` and `a.sock`. A kernel-side proxy such as
+`uds-over-rdma-proxy` shows no process in `ss -xp`, so the far-end check is
+skipped; set `UDS_PROXY_STATS` to a command that prints the proxy's counters
+and the script saves its output before and after the bench:
+
+```
+UDS_PAIRS=1 UDS_PROXY=1 UDS_PROXY_STATS='urp stats' scripts/uds-cluster-smoke.sh
+```
+
+Create the proxy endpoints after the servers are listening and before the
+mesh wait times out (`TIMEOUT`, default 10 s), or create them first: the
+servers retry their explicit routes until the proxy sockets appear. The full
+runbook, including the three-host variant where each server runs on its own
+machine, is in `doc/uds-cluster-routes-status.md` under "Real-proxy test
+runbook".

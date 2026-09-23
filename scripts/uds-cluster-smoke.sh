@@ -16,7 +16,12 @@
 #               1 ring: each server dials one proxy socket; socat forwards it
 #               to the next server, standing in for uds-over-rdma-proxy.
 #   UDS_PROXY   1 with UDS_PAIRS=1 to skip starting socat because an external
-#               proxy (uds-over-rdma-proxy) already serves ab/bc/ca.sock.
+#               proxy (uds-over-rdma-proxy) already serves ab/bc/ca.sock. The
+#               socat far-end check is skipped: a kernel proxy has no process.
+#   UDS_PROXY_STATS
+#               optional shell command (e.g. "urp stats") run before and after
+#               the bench when UDS_PROXY=1; its output is saved as evidence so
+#               the proxy's own byte counters prove the traffic crossed it.
 #   UDS_DIR     socket directory (default /tmp/nats-uds; keep it short).
 #   OUT         output directory for binary, logs and evidence (default mktemp).
 #   NATS_CLI    nats CLI command (default: nats from PATH, else nix shell).
@@ -29,6 +34,7 @@ set -euo pipefail
 
 UDS_PAIRS=${UDS_PAIRS:-0}
 UDS_PROXY=${UDS_PROXY:-0}
+UDS_PROXY_STATS=${UDS_PROXY_STATS:-}
 UDS_DIR=${UDS_DIR:-/tmp/nats-uds}
 OUT=${OUT:-$(mktemp -d /tmp/nats-uds-out.XXXXXX)}
 BENCH_MSGS=${BENCH_MSGS:-100000}
@@ -260,7 +266,15 @@ for n in "${SERVERS[@]}"; do
 	fi
 done
 if [ "$UDS_PAIRS" = 1 ]; then
-	if ss -xp | grep -F "$UDS_DIR" | grep -q socat; then
+	if [ "$UDS_PROXY" = 1 ]; then
+		# An external proxy owns ab/bc/ca.sock. A kernel-side proxy such as
+		# uds-over-rdma-proxy has no user-space process, so ss -xp cannot name
+		# it; the proof that bytes crossed the proxy is its own counters.
+		log "external proxy serves ab/bc/ca.sock; far-end process check skipped"
+		if [ -n "$UDS_PROXY_STATS" ]; then
+			evidence proxy-stats-before bash -c "$UDS_PROXY_STATS"
+		fi
+	elif ss -xp | grep -F "$UDS_DIR" | grep -q socat; then
 		pass "ss -xp shows the proxy (socat) on the far end of the route sockets"
 	else
 		fail "ss -xp does not show socat on any route socket"
@@ -299,6 +313,10 @@ if wait "$benchpid"; then
 	show "$OUT/bench-sub-b.txt"
 else
 	fail "nats bench subscriber did not complete (see $OUT/bench-sub-b.txt)"
+fi
+if [ "$UDS_PAIRS" = 1 ] && [ "$UDS_PROXY" = 1 ] && [ -n "$UDS_PROXY_STATS" ]; then
+	# Compare with proxy-stats-before: the bench bytes must show up here.
+	evidence proxy-stats-after bash -c "$UDS_PROXY_STATS"
 fi
 
 # 7. SIGKILL B, leaving its socket file behind, and restart it.
