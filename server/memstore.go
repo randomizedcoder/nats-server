@@ -305,15 +305,13 @@ func (ms *memStore) storeRawMsg(subj string, hdr, msg []byte, seq uint64, ts, tt
 		ms.state.FirstTime = now
 	}
 
-	// Make copies
-	// TODO(dlc) - Maybe be smarter here.
-	if len(msg) > 0 {
-		msg = copyBytes(msg)
-	}
-	if len(hdr) > 0 {
-		hdr = copyBytes(hdr)
-	}
-
+	// sm.buf is a freshly allocated, exact-sized buffer and the appends below
+	// copy hdr/msg into it -- that append IS the private copy this store needs.
+	// Previously we also copyBytes(hdr)/copyBytes(msg) first, allocating and
+	// copying a second time only to discard those slices at the append. That
+	// doubled the alloc + copy (and the make() zero-fill) for every stored
+	// message -- expensive for large payloads. Append the caller's slices
+	// directly; the result is identical.
 	// FIXME(dlc) - Could pool at this level?
 	sm := &StoreMsg{subj, nil, nil, make([]byte, 0, len(hdr)+len(msg)), seq, ts}
 	sm.buf = append(sm.buf, hdr...)
