@@ -1,0 +1,12 @@
+# statix.toml — scope for the `statix check` Nix linter (nix/checks/statix.nix).
+#
+# Only the flake's own Nix lives at the root and under nix/; ignore everything
+# else (vendored Go deps, VCS, and build outputs).
+disabled = []
+nix_version = "2.4"
+ignore = [
+  "vendor",
+  ".git",
+  "result",
+  "result-*",
+]
