@@ -277,6 +277,7 @@ type client struct {
 	nonce      []byte
 	pubKey     string
 	nc         net.Conn
+	fast       *fastConn // non-nil ⇒ zero-copy fast transport (design 58 P2); nc stays nil
 	ncs        atomic.Value
 	ncsAcc     atomic.Value
 	ncsUser    atomic.Value
@@ -805,6 +806,15 @@ func (c *client) initClient() {
 				}
 				// Now that we have extracted host and port, escape
 				// the string because it is going to be used in Sprintf
+				conn = strings.ReplaceAll(conn, "%", "%%")
+			}
+		}
+	} else if c.fast != nil {
+		// A fast (urp) route has no net.Conn; name it by its endpoint address
+		// (fastAddr) so /routez and logs identify the transport and peer.
+		if addr := c.fast.RemoteAddr(); addr != nil {
+			if conn = addr.String(); conn != _EMPTY_ {
+				c.host, c.port = conn, 0
 				conn = strings.ReplaceAll(conn, "%", "%%")
 			}
 		}
@@ -1501,6 +1511,16 @@ func (c *client) readLoop(pre []byte) {
 		c.mu.Unlock()
 		return
 	}
+	// Fast endpoint (design 58 P2c): a zero-copy route reads whole pool
+	// buffers by index rather than bytes off a net.Conn, so it runs a distinct
+	// RX seam. s.grWG.Done() is already deferred above, so readLoopFast must not
+	// touch it. c.fast is nil for every tcp/unix/ws client, so this branch is
+	// never taken there and the server behaves byte-identically to upstream.
+	if c.fast != nil {
+		c.mu.Unlock()
+		c.readLoopFast()
+		return
+	}
 	nc := c.nc
 	ws := c.isWebsocket()
 	if c.isMqtt() {
@@ -1755,6 +1775,13 @@ func (c *client) collapsePtoNB() (net.Buffers, int64) {
 // Will return true if data was attempted to be written.
 // Lock must be held
 func (c *client) flushOutbound() bool {
+	// design 58 P2b: a fast-endpoint route transmits over the zero-copy
+	// endpoint, not a net.Conn. c.fast is nil for every TCP/unix client, so
+	// this branch is unreached with FastEndpoint unset (byte-identical to
+	// upstream).
+	if c.fast != nil {
+		return c.flushOutboundFast()
+	}
 	if c.flags.isSet(flushOutbound) {
 		// For CLIENT connections, it is possible that the readLoop calls
 		// flushOutbound(). If writeLoop and readLoop compete and we are
@@ -6116,6 +6143,14 @@ func (c *client) flushAndClose(minimalFlush bool) {
 			nc.Close()
 		}
 	}
+	// Fast endpoint (design 58 P2c): a fast client has c.nc == nil, so the
+	// block above never releases its transport. Close the zero-copy endpoint
+	// here so its owned buffers and completion goroutine are released on
+	// teardown. c.fast is nil for every tcp/unix/ws client (byte-identical).
+	if c.fast != nil {
+		c.fast.Close()
+		c.fast = nil
+	}
 }
 
 var kindStringMap = map[int]string{
@@ -6969,7 +7004,10 @@ func (c *client) connectionTypeAllowed(acts map[string]struct{}) bool {
 // isClosed returns true if either closeConnection or connMarkedClosed
 // flag have been set, or if `nc` is nil, which may happen in tests.
 func (c *client) isClosed() bool {
-	return c.flags.isSet(closeConnection) || c.flags.isSet(connMarkedClosed) || c.nc == nil
+	// A fast-endpoint client (design 58 P2) has no net.Conn: its liveness is
+	// the fast transport, not c.nc. With FastEndpoint unset c.fast is nil and
+	// this reduces to the original c.nc == nil check (byte-identical).
+	return c.flags.isSet(closeConnection) || c.flags.isSet(connMarkedClosed) || (c.nc == nil && c.fast == nil)
 }
 
 func (c *client) format(format string) string {

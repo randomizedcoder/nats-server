@@ -2023,17 +2023,31 @@ func (c *client) sendRouteSubOrUnSubProtos(subs []*subscription, isSubProto, tra
 	c.enqueueProto(buf)
 }
 
-func (s *Server) createRoute(conn net.Conn, rURL *url.URL, rtype RouteType, gossipMode byte, accName string) *client {
+// createRoute builds a ROUTER client for a new route connection. conn is the
+// transport for a TCP or unix-socket route; for a fast (urp) route conn is nil
+// and fc carries the zero-copy endpoint instead (design 58 route model §6). A
+// fast route reuses this whole constructor unchanged except that it has no TLS
+// (rejected at config), no compression and no delayed INFO — a fast endpoint is
+// a single point-to-point attach, so it behaves like a no-pool connection and
+// the INFO/CONNECT handshake flows through the readLoopFast/flushOutboundFast
+// seams exactly as it would over a net.Conn.
+func (s *Server) createRoute(conn net.Conn, fc *fastConn, rURL *url.URL, rtype RouteType, gossipMode byte, accName string) *client {
 	// Snapshot server options.
 	opts := s.getOpts()
 
 	didSolicit := rURL != nil
-	r := &route{routeType: rtype, didSolicit: didSolicit, poolIdx: -1, gossipMode: gossipMode, transport: routeTransport(conn)}
+	transport := routeTransport(conn)
+	if fc != nil {
+		transport = routeTransportFast
+	}
+	r := &route{routeType: rtype, didSolicit: didSolicit, poolIdx: -1, gossipMode: gossipMode, transport: transport}
 
-	c := &client{srv: s, nc: conn, opts: ClientOpts{}, kind: ROUTER, msubs: -1, mpay: -1, route: r, start: time.Now()}
+	c := &client{srv: s, nc: conn, fast: fc, opts: ClientOpts{}, kind: ROUTER, msubs: -1, mpay: -1, route: r, start: time.Now()}
 
-	// Is the server configured for compression?
-	compressionConfigured := needsCompression(opts.Cluster.Compression.Mode)
+	// Is the server configured for compression? A fast route never compresses
+	// (flushOutboundFast ships whole pool buffers; there is no s2 stream to
+	// wrap), so force it off regardless of cluster.compression.
+	compressionConfigured := needsCompression(opts.Cluster.Compression.Mode) && fc == nil
 
 	var infoJSON []byte
 	// Grab server variables and generates route INFO Json. Note that we set
@@ -2043,9 +2057,16 @@ func (s *Server) createRoute(conn net.Conn, rURL *url.URL, rtype RouteType, goss
 	// If we are creating a pooled connection and this is the server soliciting
 	// the connection, we will delay sending the INFO after we have processed
 	// the incoming INFO from the remote. Also delay if configured for compression.
-	delayInfo := didSolicit && (compressionConfigured || routeShouldDelayInfo(accName, opts))
+	// A fast route never delays INFO: with no compression to negotiate and no
+	// pooling (one endpoint = one point-to-point route), the initial INFO is
+	// always sent immediately over the seam.
+	delayInfo := didSolicit && fc == nil && (compressionConfigured || routeShouldDelayInfo(accName, opts))
 	if !delayInfo {
-		infoJSON = s.generateRouteInitialInfoJSON(accName, opts.Cluster.Compression.Mode, 0, gossipMode)
+		compressionMode := opts.Cluster.Compression.Mode
+		if fc != nil {
+			compressionMode = CompressionOff
+		}
+		infoJSON = s.generateRouteInitialInfoJSON(accName, compressionMode, 0, gossipMode)
 	}
 	authRequired := s.routeInfo.AuthRequired
 	tlsRequired := s.routeInfo.TLSRequired
@@ -2819,7 +2840,15 @@ func (s *Server) startRouteAcceptLoop() {
 		e error
 	)
 	unixSocket := opts.Cluster.UnixSocket
-	if unixSocket != _EMPTY_ {
+	fastEndpoint := opts.Cluster.FastEndpoint
+	if fastEndpoint != _EMPTY_ {
+		// A fast (urp) endpoint is connectionless and pre-provisioned, so there
+		// is no net.Listener to bind: l stays nil and the accept arm
+		// (startFastRouteAccept) attaches to the named endpoint instead
+		// (design 58 route model §7). s.routeInfo is still built below so this
+		// server sends INFO over the fast route.
+		s.Noticef("Attaching route accept to fast endpoint %s%s", fastSchemePrefix, fastEndpoint)
+	} else if unixSocket != _EMPTY_ {
 		l, e = s.listenRouteUnix(unixSocket)
 		s.routeListenerErr = e
 		if e != nil {
@@ -2864,11 +2893,14 @@ func (s *Server) startRouteAcceptLoop() {
 		LN:           true,
 	}
 	// For tests that want to simulate old servers, do not set the compression
-	// on the INFO protocol if configured with CompressionNotSupported.
-	if cm := opts.Cluster.Compression.Mode; cm != CompressionNotSupported {
+	// on the INFO protocol if configured with CompressionNotSupported. A fast
+	// endpoint never compresses and is never pooled (route model §5/§6), so it
+	// advertises neither, keeping both fast ends in the no-compression no-pool
+	// regime.
+	if cm := opts.Cluster.Compression.Mode; cm != CompressionNotSupported && fastEndpoint == _EMPTY_ {
 		info.Compression = cm
 	}
-	if ps := opts.Cluster.PoolSize; ps > 0 {
+	if ps := opts.Cluster.PoolSize; ps > 0 && fastEndpoint == _EMPTY_ {
 		info.RoutePoolSize = ps
 	}
 	// Set this if only if advertise is not disabled
@@ -2876,10 +2908,13 @@ func (s *Server) startRouteAcceptLoop() {
 		info.ClientConnectURLs = s.clientConnectURLs
 		info.WSConnectURLs = s.websocket.connectURLs
 	}
-	// If we have selected a random port...
-	if tcpAddr, ok := l.Addr().(*net.TCPAddr); ok && port == 0 {
-		// Write resolved port back to options.
-		opts.Cluster.Port = tcpAddr.Port
+	// If we have selected a random port... (a fast endpoint has no listener,
+	// l is nil, so skip.)
+	if l != nil {
+		if tcpAddr, ok := l.Addr().(*net.TCPAddr); ok && port == 0 {
+			// Write resolved port back to options.
+			opts.Cluster.Port = tcpAddr.Port
+		}
 	}
 	// Check for Auth items
 	if opts.Cluster.Username != "" {
@@ -2902,7 +2937,9 @@ func (s *Server) startRouteAcceptLoop() {
 	// Possibly override Host/Port and set IP based on Cluster.Advertise
 	if err := s.setRouteInfoHostPortAndIP(); err != nil {
 		s.Fatalf("Error setting route INFO with Cluster.Advertise value of %s, err=%v", opts.Cluster.Advertise, err)
-		l.Close()
+		if l != nil {
+			l.Close()
+		}
 		s.mu.Unlock()
 		return
 	}
@@ -2915,8 +2952,13 @@ func (s *Server) startRouteAcceptLoop() {
 
 	// Now that we have the port, keep track of all ip:port that resolve to this server.
 	// A unix socket listener has no ip:port; record its own path (and the
-	// advertised path, if any) instead so that connectToRoute skips them.
-	if unixSocket != _EMPTY_ {
+	// advertised path, if any) instead so that connectToRoute skips them. A
+	// fast endpoint is pre-provisioned point-to-point and never gossiped, so
+	// there is no self-address to record (an operator would not urp-add a route
+	// to the same node).
+	if fastEndpoint != _EMPTY_ {
+		// no self-address for a fast endpoint
+	} else if unixSocket != _EMPTY_ {
 		s.updateUnixRoutesToSelf(&opts.Cluster)
 	} else if interfaceAddr, err := net.InterfaceAddrs(); err == nil {
 		var localIPs []string
@@ -2934,13 +2976,19 @@ func (s *Server) startRouteAcceptLoop() {
 		}
 	}
 
-	// Start the accept loop in a different go routine.
-	go s.acceptConnections(l, "Route", func(conn net.Conn) {
-		if unixSocket != _EMPTY_ {
-			s.udsStats.accepted.Add(1)
-		}
-		s.createRoute(conn, nil, Implicit, gossipDefault, _EMPTY_)
-	}, nil)
+	// Start the accept loop in a different go routine. A fast endpoint has no
+	// net.Listener: instead of acceptConnections it attaches to the named urp
+	// endpoint and re-arms per peer (route model §7).
+	if fastEndpoint != _EMPTY_ {
+		s.startGoRoutine(func() { s.startFastRouteAccept(fastEndpoint) })
+	} else {
+		go s.acceptConnections(l, "Route", func(conn net.Conn) {
+			if unixSocket != _EMPTY_ {
+				s.udsStats.accepted.Add(1)
+			}
+			s.createRoute(conn, nil, nil, Implicit, gossipDefault, _EMPTY_)
+		}, nil)
+	}
 
 	// Solicit Routes if applicable. This will not block.
 	s.solicitRoutes(opts.Routes, opts.Cluster.PinnedAccounts)
@@ -2973,6 +3021,13 @@ func (s *Server) setRouteInfoHostPortAndIP() error {
 		// A unix socket path is only meaningful on this host, so nothing
 		// is advertised: peers learn about this server but do not dial
 		// it unless they have an explicit route.
+		s.routeInfo.Host = _EMPTY_
+		s.routeInfo.Port = 0
+		s.routeInfo.IP = _EMPTY_
+	case opts.Cluster.FastEndpoint != _EMPTY_:
+		// A fast (urp) endpoint is pre-provisioned point-to-point (design 58
+		// route model §4): it is never gossiped, so a fast server advertises
+		// no route URL. Peers attach only via their own configured urp:// route.
 		s.routeInfo.Host = _EMPTY_
 		s.routeInfo.Port = 0
 		s.routeInfo.IP = _EMPTY_
@@ -3030,6 +3085,13 @@ func (s *Server) routeStillValid(rURL *url.URL) bool {
 func (s *Server) connectToRoute(rURL *url.URL, rtype RouteType, firstConnect bool, gossipMode byte, accName string) {
 	defer s.grWG.Done()
 	if rURL == nil {
+		return
+	}
+	// A fast (urp://) route is not dialed as a net.Conn; it attaches to a
+	// pre-provisioned urp endpoint. Delegate to the fast connect loop, which
+	// runs in this same goroutine (the deferred grWG.Done above covers it).
+	if isFastRouteURL(rURL) {
+		s.connectFastRoute(rURL, rtype, firstConnect, gossipMode, accName)
 		return
 	}
 	// For explicit routes, we will try to connect until we succeed. For implicit
@@ -3138,7 +3200,7 @@ func (s *Server) connectToRoute(rURL *url.URL, rtype RouteType, firstConnect boo
 
 		// We have a route connection here.
 		// Go ahead and create it and exit this func.
-		s.createRoute(conn, rURL, rtype, gossipMode, accName)
+		s.createRoute(conn, nil, rURL, rtype, gossipMode, accName)
 		return
 	}
 }
@@ -3154,8 +3216,9 @@ func (c *client) isSolicitedRoute() bool {
 // Lock is held on entry
 func (s *Server) saveRouteTLSName(routes []*url.URL) {
 	for _, u := range routes {
-		// A unix socket URL has no hostname to verify a certificate with.
-		if isUnixRouteURL(u) {
+		// A unix socket or fast (urp) URL has no hostname to verify a
+		// certificate with (and fast carries no TLS at all).
+		if isUnixRouteURL(u) || isFastRouteURL(u) {
 			continue
 		}
 		if s.routeTLSName == _EMPTY_ && net.ParseIP(u.Hostname()) == nil {

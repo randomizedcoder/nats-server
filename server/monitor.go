@@ -837,7 +837,7 @@ type RouteInfo struct {
 	IsConfigured bool               `json:"is_configured"`
 	IP           string             `json:"ip"`
 	Port         int                `json:"port"`
-	Transport    string             `json:"transport"`             // Transport is the route connection transport, "tcp" or "unix"
+	Transport    string             `json:"transport"`             // Transport is the route connection transport, "tcp", "unix" or "fast"
 	UnixSocket   string             `json:"unix_socket,omitempty"` // UnixSocket is the peer socket address of a solicited unix route
 	Start        time.Time          `json:"start"`
 	LastActivity time.Time          `json:"last_activity"`

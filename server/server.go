@@ -1117,6 +1117,23 @@ func validateClusterListenTransport(c *ClusterOpts) error {
 	if unixListener && (c.Host != _EMPTY_ || c.Port != 0) {
 		return errors.New("unix socket listen and host/port are mutually exclusive")
 	}
+	// Fast (urp) endpoint listener rules (design 58 route model §4/§5). The
+	// three listener transports are pairwise exclusive; a fast endpoint carries
+	// no TLS (its handshake is not a byte stream, decision 5) and is never
+	// gossiped, so an advertise address is meaningless for it (decision 4).
+	fastListener := c.FastEndpoint != _EMPTY_
+	if fastListener && (c.Host != _EMPTY_ || c.Port != 0) {
+		return errors.New("fast endpoint and host/port are mutually exclusive")
+	}
+	if fastListener && unixListener {
+		return errors.New("fast endpoint and unix socket listen are mutually exclusive")
+	}
+	if fastListener && c.TLSConfig != nil {
+		return errors.New("cluster tls is not supported with a fast endpoint")
+	}
+	if fastListener && c.Advertise != _EMPTY_ {
+		return errors.New("advertise is not supported with a fast endpoint (fast routes are not gossiped)")
+	}
 	if c.Advertise == _EMPTY_ || !c.listenEnabled() {
 		return nil
 	}

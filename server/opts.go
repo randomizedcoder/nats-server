@@ -94,17 +94,26 @@ type ClusterOpts struct {
 	// on Windows). Host and Port must be zero when it is set.
 	UnixSocket string `json:"-"`
 
+	// FastEndpoint, when non-empty, makes the route transport a urp
+	// zero-copy fast endpoint (design 58 P2) instead of TCP or a Unix
+	// socket. It holds the urp endpoint name (registered against /dev/urp
+	// via a REGISTER uring_cmd); the wire cap is 15 bytes (urpcmd.NameMax-1).
+	// Host, Port, and UnixSocket must all be zero when it is set: the three
+	// transports are mutually exclusive.
+	FastEndpoint string `json:"-"`
+
 	// Not exported (used in tests)
 	resolver netResolver
 	// Snapshot of configured TLS options.
 	tlsConfigOpts *TLSConfigOpts
 }
 
-// listenEnabled reports whether a route listener is configured, either on a
-// TCP host:port or on a Unix domain socket. Every "is clustering enabled"
-// decision goes through here rather than testing Port directly.
+// listenEnabled reports whether a route listener is configured, on a TCP
+// host:port, a Unix domain socket, or a urp fast endpoint. Every "is
+// clustering enabled" decision goes through here rather than testing Port
+// directly.
 func (c *ClusterOpts) listenEnabled() bool {
-	return c.Port != 0 || c.UnixSocket != _EMPTY_
+	return c.Port != 0 || c.UnixSocket != _EMPTY_ || c.FastEndpoint != _EMPTY_
 }
 
 // CompressionOpts defines the compression mode and optional configuration.
@@ -2085,6 +2094,18 @@ func parseCluster(v any, opts *Options, errors *[]error, warnings *[]error) erro
 			}
 			opts.Cluster.Host = hp.host
 			opts.Cluster.Port = hp.port
+		case "fast_endpoint":
+			name, ok := mv.(string)
+			if !ok {
+				*errors = append(*errors, &configErr{tk, "fast_endpoint must be a string (urp endpoint name)"})
+				continue
+			}
+			if err := validateFastEndpointName(name); err != nil {
+				*errors = append(*errors, &configErr{tk, err.Error()})
+				continue
+			}
+			listenTk = tk
+			opts.Cluster.FastEndpoint = name
 		case "port":
 			opts.Cluster.Port = int(mv.(int64))
 		case "host", "net":
@@ -2224,9 +2245,32 @@ func parseCluster(v any, opts *Options, errors *[]error, warnings *[]error) erro
 	return nil
 }
 
+// fastEndpointNameMax is the urp endpoint-name wire cap (urpcmd.NameMax-1 = 15
+// usable bytes; the 16th byte is the NUL terminator). The fork mirrors the
+// constant here rather than importing the driver library so opts parsing has
+// no cgo/linux dependency.
+const fastEndpointNameMax = 15
+
+// validateFastEndpointName rejects a fast_endpoint that the urp REGISTER
+// uring_cmd could not carry: it must be non-empty, hold no NUL byte, and fit
+// the 15-byte wire cap.
+func validateFastEndpointName(name string) error {
+	if name == _EMPTY_ {
+		return errors.New("fast_endpoint must not be empty")
+	}
+	if strings.IndexByte(name, 0) >= 0 {
+		return errors.New("fast_endpoint must not contain a NUL byte")
+	}
+	if len(name) > fastEndpointNameMax {
+		return fmt.Errorf("fast_endpoint %q exceeds the %d-byte urp endpoint-name cap", name, fastEndpointNameMax)
+	}
+	return nil
+}
+
 // checkClusterListenTransport applies the parse-time rules that relate the
 // route listener transport to the other cluster fields:
-//   - a unix socket listen is mutually exclusive with host/port;
+//   - the three listener transports (host/port, unix socket, urp fast
+//     endpoint) are pairwise mutually exclusive;
 //   - an advertise address must use the same transport as the listener and,
 //     when it is a unix:// URL, must be a valid unix socket address.
 //
@@ -2235,9 +2279,16 @@ func parseCluster(v any, opts *Options, errors *[]error, warnings *[]error) erro
 // the -cluster flag is validated later by validateCluster.
 func checkClusterListenTransport(c *ClusterOpts, listenTk, advertiseTk token) error {
 	unixListener := c.UnixSocket != _EMPTY_
+	fastListener := c.FastEndpoint != _EMPTY_
 	tcpListener := c.Host != _EMPTY_ || c.Port != 0
 	if unixListener && tcpListener {
 		return &configErr{listenTk, "unix socket listen and host/port are mutually exclusive"}
+	}
+	if fastListener && tcpListener {
+		return &configErr{listenTk, "fast endpoint and host/port are mutually exclusive"}
+	}
+	if fastListener && unixListener {
+		return &configErr{listenTk, "fast endpoint and unix socket listen are mutually exclusive"}
 	}
 	if c.Advertise == _EMPTY_ {
 		return nil
@@ -2342,6 +2393,15 @@ func parseURL(u string, typ string) (*url.URL, error) {
 			return nil, fmt.Errorf("error parsing %s url [%q]: %v", typ, urlStr, err)
 		}
 		return unixRouteURL(addr), nil
+	}
+	// Routes may be fast (urp) endpoint names; store them in the canonical
+	// urp://<name> form so URL comparisons in reload and reconnect are by value.
+	if typ == "route" && hasFastScheme(urlStr) {
+		name, err := parseFastAddr(urlStr)
+		if err != nil {
+			return nil, fmt.Errorf("error parsing %s url [%q]: %v", typ, urlStr, err)
+		}
+		return fastRouteURL(name), nil
 	}
 	url, err := url.Parse(urlStr)
 	if err != nil {

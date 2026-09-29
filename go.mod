@@ -13,7 +13,10 @@ require (
 	github.com/nats-io/nats.go v1.51.0
 	github.com/nats-io/nkeys v0.4.16
 	github.com/nats-io/nuid v1.0.1
+	github.com/randomizedcoder/uds-rdma-proxy/tools/urp-fast-go v0.1.0
 	golang.org/x/crypto v0.57.0
 	golang.org/x/sys v0.48.0
 	golang.org/x/time v0.16.0
 )
+
+require github.com/randomizedcoder/giouring v1.1.0 // indirect
