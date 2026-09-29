@@ -6190,8 +6190,10 @@ func setBaselineOptions(opts *Options) {
 		opts.AuthTimeout = getDefaultAuthTimeout(opts.TLSConfig, opts.TLSTimeout)
 	}
 	if opts.Cluster.listenEnabled() || opts.Cluster.ListenStr != _EMPTY_ {
-		// A unix socket listener has no host to default.
-		if opts.Cluster.Host == _EMPTY_ && opts.Cluster.UnixSocket == _EMPTY_ {
+		// A unix socket or urp fast-endpoint listener has no host to default;
+		// defaulting one would make checkClusterListenTransport reject the
+		// (otherwise valid) fast/unix listener as conflicting with a host/port.
+		if opts.Cluster.Host == _EMPTY_ && opts.Cluster.UnixSocket == _EMPTY_ && opts.Cluster.FastEndpoint == _EMPTY_ {
 			opts.Cluster.Host = DEFAULT_HOST
 		}
 		if opts.Cluster.TLSTimeout == 0 {

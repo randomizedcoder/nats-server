@@ -153,3 +153,64 @@ func TestValidateFastEndpointName(t *testing.T) {
 		})
 	}
 }
+
+// TestSetBaselineOptionsFastEndpoint is the regression for the bug where a
+// fast-endpoint-only cluster (no host/port, no unix socket) survived the
+// parse-time check but then had Cluster.Host defaulted to DEFAULT_HOST by
+// setBaselineOptions -- which made the later validateClusterListenTransport
+// reject it as "fast endpoint and host/port are mutually exclusive" at startup
+// (config parsed with `-t` OK, real server exited 1). A fast listener, like a
+// unix listener, has no host to invent. Mirrors TestSetBaselineOptionsUnixSocket.
+func TestSetBaselineOptionsFastEndpoint(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		description string
+		cluster     ClusterOpts
+		expected    ClusterOpts
+	}{
+		// positive: the bug -- fast endpoint alone must NOT get a defaulted host.
+		{
+			description: "fast listener gets pool size and timeouts but no host",
+			cluster:     ClusterOpts{FastEndpoint: "na_ca"},
+			expected:    ClusterOpts{FastEndpoint: "na_ca", Host: _EMPTY_, PoolSize: DEFAULT_ROUTE_POOL_SIZE},
+		},
+		// negative: a tcp listener still defaults its host (unchanged behaviour).
+		{
+			description: "tcp listener still defaults host",
+			cluster:     ClusterOpts{Port: 6222},
+			expected:    ClusterOpts{Port: 6222, Host: DEFAULT_HOST, PoolSize: DEFAULT_ROUTE_POOL_SIZE},
+		},
+		// boundary: no listener at all leaves the cluster options untouched.
+		{
+			description: "no listener leaves cluster options alone",
+			cluster:     ClusterOpts{},
+			expected:    ClusterOpts{},
+		},
+		// corner: an explicit host alongside a fast endpoint is left as-is for
+		// validation to reject (baseline must not mask the conflict).
+		{
+			description: "explicit host with fast endpoint is left for validation to reject",
+			cluster:     ClusterOpts{FastEndpoint: "na_ca", Host: "127.0.0.1"},
+			expected:    ClusterOpts{FastEndpoint: "na_ca", Host: "127.0.0.1", PoolSize: DEFAULT_ROUTE_POOL_SIZE},
+		},
+	} {
+		t.Run(tc.description, func(t *testing.T) {
+			opts := &Options{Cluster: tc.cluster, NoSystemAccount: true}
+			setBaselineOptions(opts)
+			got := opts.Cluster
+			if got.Host != tc.expected.Host || got.Port != tc.expected.Port ||
+				got.FastEndpoint != tc.expected.FastEndpoint || got.PoolSize != tc.expected.PoolSize {
+				t.Fatalf("got Host=%q Port=%d FastEndpoint=%q PoolSize=%d, expected Host=%q Port=%d FastEndpoint=%q PoolSize=%d",
+					got.Host, got.Port, got.FastEndpoint, got.PoolSize,
+					tc.expected.Host, tc.expected.Port, tc.expected.FastEndpoint, tc.expected.PoolSize)
+			}
+			// A fast-endpoint-only cluster must also pass validation after
+			// baselining -- this is the exact path that failed at startup.
+			if tc.expected.FastEndpoint != _EMPTY_ && tc.expected.Host == _EMPTY_ {
+				if err := validateClusterListenTransport(&got); err != nil {
+					t.Fatalf("fast endpoint alone failed validation after baselining: %v", err)
+				}
+			}
+		})
+	}
+}
