@@ -168,11 +168,14 @@ func TestSetBaselineOptionsFastEndpoint(t *testing.T) {
 		cluster     ClusterOpts
 		expected    ClusterOpts
 	}{
-		// positive: the bug -- fast endpoint alone must NOT get a defaulted host.
+		// positive: the bug -- fast endpoint alone must NOT get a defaulted host,
+		// and defaults to no-pool (PoolSize -1) because it is a single
+		// point-to-point connection that cannot back a route pool or a dedicated
+		// per-account route.
 		{
-			description: "fast listener gets pool size and timeouts but no host",
+			description: "fast listener defaults to no-pool and gets no host",
 			cluster:     ClusterOpts{FastEndpoint: "na_ca"},
-			expected:    ClusterOpts{FastEndpoint: "na_ca", Host: _EMPTY_, PoolSize: DEFAULT_ROUTE_POOL_SIZE},
+			expected:    ClusterOpts{FastEndpoint: "na_ca", Host: _EMPTY_, PoolSize: -1},
 		},
 		// negative: a tcp listener still defaults its host (unchanged behaviour).
 		{
@@ -191,7 +194,7 @@ func TestSetBaselineOptionsFastEndpoint(t *testing.T) {
 		{
 			description: "explicit host with fast endpoint is left for validation to reject",
 			cluster:     ClusterOpts{FastEndpoint: "na_ca", Host: "127.0.0.1"},
-			expected:    ClusterOpts{FastEndpoint: "na_ca", Host: "127.0.0.1", PoolSize: DEFAULT_ROUTE_POOL_SIZE},
+			expected:    ClusterOpts{FastEndpoint: "na_ca", Host: "127.0.0.1", PoolSize: -1},
 		},
 	} {
 		t.Run(tc.description, func(t *testing.T) {

@@ -6203,7 +6203,18 @@ func setBaselineOptions(opts *Options) {
 			opts.Cluster.AuthTimeout = getDefaultAuthTimeout(opts.Cluster.TLSConfig, opts.Cluster.TLSTimeout)
 		}
 		if opts.Cluster.PoolSize == 0 {
-			opts.Cluster.PoolSize = DEFAULT_ROUTE_POOL_SIZE
+			// A fast (urp) endpoint is a single point-to-point connection over
+			// one RDMA QP-set: route pooling and per-account dedicated routes
+			// each need an additional connection the endpoint cannot provide, so
+			// the extra opens fail REGISTER (EIO) and the dedicated "$SYS" route
+			// is a protocol violation between the peers. Default a fast endpoint
+			// to no-pool (single route), the same regime an old non-pooling peer
+			// uses. A unix socket does not need this: it can open N connections.
+			if opts.Cluster.FastEndpoint != _EMPTY_ {
+				opts.Cluster.PoolSize = -1
+			} else {
+				opts.Cluster.PoolSize = DEFAULT_ROUTE_POOL_SIZE
+			}
 		}
 		// Unless pooling/accounts are disabled (by PoolSize being set to -1),
 		// check for Cluster.Accounts. Add the system account if not present and
