@@ -2038,7 +2038,7 @@ func (s *Server) createRoute(conn net.Conn, fc *fastConn, rURL *url.URL, rtype R
 	didSolicit := rURL != nil
 	transport := routeTransport(conn)
 	if fc != nil {
-		transport = routeTransportFast
+		transport = fc.transport
 	}
 	r := &route{routeType: rtype, didSolicit: didSolicit, poolIdx: -1, gossipMode: gossipMode, transport: transport}
 
@@ -2982,9 +2982,25 @@ func (s *Server) startRouteAcceptLoop() {
 	if fastEndpoint != _EMPTY_ {
 		s.startGoRoutine(func() { s.startFastRouteAccept(fastEndpoint) })
 	} else {
+		tcpzc := opts.Cluster.TCPZC
 		go s.acceptConnections(l, "Route", func(conn net.Conn) {
 			if unixSocket != _EMPTY_ {
 				s.udsStats.accepted.Add(1)
+			}
+			// tcpzc drives the accepted plain-TCP route via io_uring: dup the fd
+			// out of conn and build the route over a tcpzc fastConn instead of the
+			// net.Conn. The wire is identical to a TCP route (§9a), so the peer may
+			// be tcp or tcpzc. On a wrap failure the fd is already closed.
+			if tcpzc {
+				fc, err := s.openTCPZCConn(conn, "route-accept")
+				if err != nil {
+					s.Errorf("Error wrapping accepted route in tcpzc: %v", err)
+					return
+				}
+				if s.createRoute(nil, fc, nil, Implicit, gossipDefault, _EMPTY_) == nil {
+					fc.Close()
+				}
+				return
 			}
 			s.createRoute(conn, nil, nil, Implicit, gossipDefault, _EMPTY_)
 		}, nil)
@@ -3199,6 +3215,22 @@ func (s *Server) connectToRoute(rURL *url.URL, rtype RouteType, firstConnect boo
 		}
 
 		// We have a route connection here.
+		// A tcpzc cluster drives its plain-TCP routes via io_uring: dup the fd
+		// out of the dialed conn and build the route over a tcpzc fastConn. Only
+		// TCP dials are wrapped (a unix:// route stays a net.Conn; a urp:// route
+		// was already delegated to connectFastRoute above). On a wrap failure the
+		// fd is already closed; fall through to a reconnect attempt.
+		if opts.Cluster.TCPZC && !isUnix {
+			fc, ferr := s.openTCPZCConn(conn, "route-dial")
+			if ferr != nil {
+				s.Errorf("Error wrapping dialed route in tcpzc: %v", ferr)
+				return
+			}
+			if s.createRoute(nil, fc, rURL, rtype, gossipMode, accName) == nil {
+				fc.Close()
+			}
+			return
+		}
 		// Go ahead and create it and exit this func.
 		s.createRoute(conn, nil, rURL, rtype, gossipMode, accName)
 		return

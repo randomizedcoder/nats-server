@@ -102,6 +102,15 @@ type ClusterOpts struct {
 	// transports are mutually exclusive.
 	FastEndpoint string `json:"-"`
 
+	// TCPZC, when true, drives the ordinary TCP route transport with io_uring
+	// (IORING_OP_SEND_ZC zero-copy TX + io_uring recv) instead of the netpoller
+	// (design 58 §9a). It is a purely local drive choice: the wire is identical
+	// to a plain TCP route, so a tcpzc server interoperates with tcp peers. It
+	// requires a host/port listener (Port != 0) and is mutually exclusive with
+	// UnixSocket and FastEndpoint. Unlike FastEndpoint it carries no urp / RDMA
+	// dependency, so kernel TCP flow control (not an RC QP) is the backpressure.
+	TCPZC bool `json:"-"`
+
 	// Not exported (used in tests)
 	resolver netResolver
 	// Snapshot of configured TLS options.
@@ -2106,6 +2115,16 @@ func parseCluster(v any, opts *Options, errors *[]error, warnings *[]error) erro
 			}
 			listenTk = tk
 			opts.Cluster.FastEndpoint = name
+		case "tcpzc":
+			b, ok := mv.(bool)
+			if !ok {
+				*errors = append(*errors, &configErr{tk, "tcpzc must be a boolean"})
+				continue
+			}
+			if b {
+				listenTk = tk
+			}
+			opts.Cluster.TCPZC = b
 		case "port":
 			opts.Cluster.Port = int(mv.(int64))
 		case "host", "net":
@@ -2289,6 +2308,20 @@ func checkClusterListenTransport(c *ClusterOpts, listenTk, advertiseTk token) er
 	}
 	if fastListener && unixListener {
 		return &configErr{listenTk, "fast endpoint and unix socket listen are mutually exclusive"}
+	}
+	// tcpzc is a local drive-mode over a plain TCP route listener, not its own
+	// listener transport: it requires host/port and cannot combine with the unix
+	// or fast endpoint transports (design 58 §9a).
+	if c.TCPZC {
+		if unixListener {
+			return &configErr{listenTk, "tcpzc and unix socket listen are mutually exclusive"}
+		}
+		if fastListener {
+			return &configErr{listenTk, "tcpzc and fast endpoint are mutually exclusive"}
+		}
+		if !tcpListener {
+			return &configErr{listenTk, "tcpzc requires a host/port route listener"}
+		}
 	}
 	if c.Advertise == _EMPTY_ {
 		return nil

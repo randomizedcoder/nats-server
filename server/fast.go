@@ -40,6 +40,12 @@ import (
 // /varz, /routez and STATSZ, alongside routeTransportTCP / routeTransportUnix.
 const routeTransportFast = "fast"
 
+// routeTransportTCPZC is the transport name a tcpzc route reports. A tcpzc route
+// is wire-identical to a plain TCP route (io_uring SEND_ZC/recv is a purely local
+// drive choice); the distinct name lets /varz and the A/B harness tell a tcpzc
+// cluster from a plain-TCP one (design 58 §9a).
+const routeTransportTCPZC = "tcpzc"
+
 // Fast-endpoint route addressing (design 58 P2, route model §3).
 //
 // A solicited fast route is written as a URL "urp://<endpoint-name>", the fast
@@ -178,6 +184,11 @@ type fastConn struct {
 	ep    zeroCopyEndpoint
 	raddr net.Addr
 
+	// transport is the name this route reports (routeTransportFast for the urp
+	// backend, routeTransportTCPZC for tcpzc). createRoute reads it so both
+	// fc-backed transports are distinguishable in /varz.
+	transport string
+
 	// closedCh is closed exactly once, by Close, so the accept supervisor
 	// (startFastRouteAccept) can block until this route tears down and then
 	// re-arm the endpoint for the next peer attach (route model §8). Close is
@@ -188,7 +199,14 @@ type fastConn struct {
 
 // newFastConn wraps an endpoint bound to the urp endpoint name.
 func newFastConn(ep zeroCopyEndpoint, name string) *fastConn {
-	return &fastConn{ep: ep, raddr: fastAddr{name: name}, closedCh: make(chan struct{})}
+	return newFastConnTransport(ep, name, routeTransportFast)
+}
+
+// newFastConnTransport wraps an endpoint and records the transport name it
+// reports. The urp backend uses routeTransportFast; the tcpzc backend uses
+// routeTransportTCPZC.
+func newFastConnTransport(ep zeroCopyEndpoint, name, transport string) *fastConn {
+	return &fastConn{ep: ep, raddr: fastAddr{name: name}, transport: transport, closedCh: make(chan struct{})}
 }
 
 // Closed returns a channel closed when the endpoint has been Closed.
@@ -487,6 +505,73 @@ func (s *Server) openFastEndpoint(name string) (*fastConn, error) {
 		return nil, fmt.Errorf("fast endpoint %q: %w", name, err)
 	}
 	return newFastConn(ep, name), nil
+}
+
+// fastTCPZCOpener constructs a zeroCopyEndpoint over an already-connected TCP
+// socket fd, driving it with io_uring IORING_OP_SEND_ZC + recv (the tcpzc
+// backend, tools/urp-fast-go/tcpzc, design 58 §9a). Unlike fastEndpointOpener it
+// takes a connected fd rather than a urp endpoint name — NATS dials/accepts the
+// TCP socket itself (the tcp/uds route template) and hands ownership here — so it
+// is a separate seam. nil until the linux tcpzc backend is linked (a backend
+// registers itself from fast_tcpzc_linux.go's init via setFastTCPZCOpener).
+var fastTCPZCOpener func(fd int, name string) (zeroCopyEndpoint, error)
+
+// setFastTCPZCOpener installs the tcpzc backend used by openTCPZCEndpoint. The
+// linux tcpzc backend calls this at link time; tests may inject a mock.
+func setFastTCPZCOpener(open func(fd int, name string) (zeroCopyEndpoint, error)) {
+	fastTCPZCOpener = open
+}
+
+// openTCPZCEndpoint wraps an owned, connected TCP socket fd in a fastConn driven
+// by the tcpzc io_uring backend. The route layer dials/accepts the socket, hands
+// ownership of fd here (the backend closes it on Close), and builds a route over
+// the returned fastConn exactly as the urp fast path does. It errors when no
+// tcpzc backend is linked (non-linux, or a build without it).
+func (s *Server) openTCPZCEndpoint(fd int, name string) (*fastConn, error) {
+	if fastTCPZCOpener == nil {
+		return nil, fmt.Errorf("tcpzc endpoint %q: no tcpzc backend linked into this build", name)
+	}
+	ep, err := fastTCPZCOpener(fd, name)
+	if err != nil {
+		return nil, fmt.Errorf("tcpzc endpoint %q: %w", name, err)
+	}
+	return newFastConnTransport(ep, name, routeTransportTCPZC), nil
+}
+
+// fastTCPZCOwnFd extracts an owned, blocking socket fd from a dialed/accepted
+// route net.Conn for the tcpzc backend (it dups the descriptor out of the
+// net.Conn so io_uring, not Go's runtime poller, drives it, then closes the
+// original). nil unless the linux tcpzc backend is linked; the backend registers
+// its ownFdFromConn from fast_tcpzc_linux.go's init via setFastTCPZCOwnFd.
+var fastTCPZCOwnFd func(nc net.Conn) (int, error)
+
+// setFastTCPZCOwnFd installs the tcpzc fd-extraction helper. The linux tcpzc
+// backend calls this at link time; tests may inject a mock.
+func setFastTCPZCOwnFd(own func(nc net.Conn) (int, error)) {
+	fastTCPZCOwnFd = own
+}
+
+// openTCPZCConn takes ownership of a connected route socket (the route layer just
+// dialed or accepted it as a plain TCP net.Conn) and wraps it in a tcpzc
+// fastConn. It dups the fd out of nc (so io_uring owns it) and closes nc, then
+// hands the fd to the tcpzc backend, which closes it on Close (and on any open
+// error). On an extraction failure nc is closed here. It errors when no tcpzc
+// backend is linked (non-linux, or a build without it), so a misconfigured tcpzc
+// cluster surfaces a clear failure rather than a nil-deref.
+func (s *Server) openTCPZCConn(nc net.Conn, name string) (*fastConn, error) {
+	if fastTCPZCOwnFd == nil || fastTCPZCOpener == nil {
+		_ = nc.Close()
+		return nil, fmt.Errorf("tcpzc route %q: no tcpzc backend linked into this build", name)
+	}
+	fd, err := fastTCPZCOwnFd(nc)
+	if err != nil {
+		_ = nc.Close()
+		return nil, fmt.Errorf("tcpzc route %q: %w", name, err)
+	}
+	// ownFdFromConn has already closed nc on success; fd is ours now and is
+	// closed by the tcpzc backend (openTCPZCEndpoint -> tcpzc.Open owns it on
+	// every path).
+	return s.openTCPZCEndpoint(fd, name)
 }
 
 // connectFastRoute solicits a fast (urp://) route: it attaches to the named urp
