@@ -26,6 +26,7 @@ package server
 
 import (
 	"fmt"
+	"os"
 	"testing"
 	"time"
 
@@ -204,6 +205,75 @@ func TestTCPZCRoutePoolEveryMemberCompletes(t *testing.T) {
 
 			if err := checkRoutesStayUp(srvA, srvB, 3*time.Second); err != nil {
 				t.Fatalf("%s: %v (expected: %s)", tc.description, err, tc.expected)
+			}
+		})
+	}
+}
+
+// TestTCPZCPollTimeoutFromEnv covers the knob added so the io_uring wait window
+// can be swept on hardware. It matters more than it looks: NATS runs one ring, and
+// so one ioLoop, per ROUTE -- 8 per node on a 3-node cluster with the default route
+// pool -- so the idle wakeup rate is multiplied by the cluster and lands directly
+// in the syscalls/msg metric. The one value that must never be accepted is 0,
+// because PollOnce reads timeout <= 0 as "non-blocking" and the loop becomes a
+// userspace spin.
+func TestTCPZCPollTimeoutFromEnv(t *testing.T) {
+	for _, tc := range []struct {
+		description string
+		env         string
+		set         bool
+		expected    time.Duration
+	}{
+		{
+			description: "POS unset falls back to the default",
+			set:         false,
+			expected:    time.Duration(tcpzcDefaultPollUS) * time.Microsecond,
+		},
+		{
+			description: "POS a plain microsecond count is honoured",
+			env:         "5000",
+			set:         true,
+			expected:    5 * time.Millisecond,
+		},
+		{
+			description: "NEG a non-numeric value falls back rather than disabling the wait",
+			env:         "fast-please",
+			set:         true,
+			expected:    time.Duration(tcpzcDefaultPollUS) * time.Microsecond,
+		},
+		{
+			description: "BND zero is refused: it would turn the loop into a userspace spin",
+			env:         "0",
+			set:         true,
+			expected:    time.Duration(tcpzcDefaultPollUS) * time.Microsecond,
+		},
+		{
+			description: "BND one microsecond is a legal (if aggressive) window",
+			env:         "1",
+			set:         true,
+			expected:    time.Microsecond,
+		},
+		{
+			description: "COR an empty string is treated as unset",
+			env:         _EMPTY_,
+			set:         true,
+			expected:    time.Duration(tcpzcDefaultPollUS) * time.Microsecond,
+		},
+		{
+			description: "COR a negative value falls back (ParseUint rejects the sign)",
+			env:         "-200",
+			set:         true,
+			expected:    time.Duration(tcpzcDefaultPollUS) * time.Microsecond,
+		},
+	} {
+		t.Run(tc.description, func(t *testing.T) {
+			if tc.set {
+				t.Setenv("NATS_TCPZC_POLL_US", tc.env)
+			} else {
+				os.Unsetenv("NATS_TCPZC_POLL_US")
+			}
+			if got := tcpzcPollTimeoutFromEnv(); got != tc.expected {
+				t.Fatalf("%s: poll timeout = %v, expected %v", tc.description, got, tc.expected)
 			}
 		})
 	}

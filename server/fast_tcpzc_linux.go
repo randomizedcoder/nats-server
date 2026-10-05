@@ -58,8 +58,27 @@ func init() {
 const (
 	tcpzcDefaultBufSize uint32 = 65536
 	tcpzcDefaultCount   uint32 = 256
-	tcpzcPollTimeout           = 200 * time.Microsecond
+	// tcpzcDefaultPollUS is the ioLoop's io_uring_enter wait window. It is a
+	// SAFETY NET, not the latency path: an inbound completion wakes the enter
+	// immediately and a local producer wakes it through the eventfd (design 58
+	// P2e-5c), so a longer window costs little latency while cutting the IDLE
+	// wakeup rate proportionally. That matters because NATS runs one ring -- and
+	// so one of these loops -- per ROUTE, and a server holds pool_size x peers
+	// routes (8 per node on a 3-node cluster), so idle polling is multiplied by
+	// the cluster and lands straight in the syscalls/msg metric this work is
+	// judged on. Override with NATS_TCPZC_POLL_US to sweep it.
+	tcpzcDefaultPollUS uint32 = 200
 )
+
+// tcpzcPollTimeoutFromEnv resolves the ioLoop's wait window from
+// NATS_TCPZC_POLL_US. envUint32 already rejects a non-numeric or zero value, and
+// zero must stay rejected here: PollOnce treats timeout <= 0 as "non-blocking",
+// which makes the loop a pure userspace spin that yields only via Gosched -- the
+// shape measured at 6.3ms ping-pong RTT, and the opposite of what someone lowering
+// this knob is asking for.
+func tcpzcPollTimeoutFromEnv() time.Duration {
+	return time.Duration(envUint32("NATS_TCPZC_POLL_US", tcpzcDefaultPollUS)) * time.Microsecond
+}
 
 // tcpzcEndpoint is the zeroCopyEndpoint over a tcpzc.Conn. See the file header
 // for the single-ring-owner concurrency model. It mirrors urpEndpoint; the
@@ -68,6 +87,7 @@ const (
 type tcpzcEndpoint struct {
 	conn   *tcpzc.Conn
 	usable int
+	pollTO time.Duration
 
 	recvCh   chan recvEvent  // ioLoop -> Recv
 	reRecvCh chan uint32     // ReRecv -> ioLoop (re-arm an RX buffer)
@@ -116,6 +136,7 @@ func openTCPZCEndpointFd(fd int, name string) (zeroCopyEndpoint, error) {
 	e := &tcpzcEndpoint{
 		conn:     conn,
 		usable:   int(conn.Usable()),
+		pollTO:   tcpzcPollTimeoutFromEnv(),
 		recvCh:   make(chan recvEvent, rxN),
 		reRecvCh: make(chan uint32, rxN),
 		sendCh:   make(chan sendReq, count-rxN),
@@ -148,7 +169,7 @@ func (e *tcpzcEndpoint) ioLoop() {
 		default:
 		}
 		e.drainIntents()
-		n, err := e.conn.PollOnce(dst, tcpzcPollTimeout)
+		n, err := e.conn.PollOnce(dst, e.pollTO)
 		if err != nil {
 			e.closeOnce.Do(e.cancel)
 			return
