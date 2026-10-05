@@ -268,6 +268,10 @@ func (e *tcpzcEndpoint) Recv() (uint32, []byte, error) {
 func (e *tcpzcEndpoint) ReRecv(idx uint32) error {
 	select {
 	case e.reRecvCh <- idx:
+		// Pull ioLoop out of a blocking io_uring_enter: a channel send cannot
+		// interrupt one, so without this the handoff waits out the poll window and
+		// the poll timeout becomes the latency floor (design 58 P2e-5c).
+		e.conn.Wake()
 		return nil
 	case <-e.ctx.Done():
 		return errFastEndpointClosed
@@ -280,6 +284,7 @@ func (e *tcpzcEndpoint) ReRecv(idx uint32) error {
 func (e *tcpzcEndpoint) Send(idx, length uint32) error {
 	select {
 	case e.sendCh <- sendReq{idx: idx, length: length}:
+		e.conn.Wake() // see ReRecv: the handoff must interrupt a blocked poll
 		return nil
 	case <-e.ctx.Done():
 		return errFastEndpointClosed
