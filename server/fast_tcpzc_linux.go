@@ -92,18 +92,27 @@ func openTCPZCEndpointFd(fd int, name string) (zeroCopyEndpoint, error) {
 		count = 4
 	}
 
+	// Split: buffers [0,rxN) land recvs in the provided-buffer ring, [rxN,count)
+	// are the TX free pool. Use the library's own split so the TX pool can never
+	// disagree with the set of buffers the ring owns.
+	rxN := tcpzc.RXCountFor(count)
+
 	// tcpzc.Open takes ownership of fd and closes it on ANY error, so there is no
-	// fd to reclaim here on failure.
+	// fd to reclaim here on failure. Open also publishes buffers [0,RXCount) into
+	// a provided-buffer ring and arms ONE multishot recv over it, so the RX half
+	// is armed in bulk by the library and consumed in ring order (design 58 P2e-5
+	// — the per-buffer PostRecv arming this replaces was unordered and shredded
+	// the byte stream, §P2e-3-HW).
 	conn, err := tcpzc.Open(fd, tcpzc.Config{
 		BufSize:            bufSize,
 		Count:              count,
+		RXCount:            rxN,
 		SmallSendThreshold: envUint32("NATS_TCPZC_ZC_THRESHOLD", tcpzc.DefaultSmallSendThreshold),
 	})
 	if err != nil {
 		return nil, err
 	}
 
-	rxN := tcpzcRXCount(count)
 	e := &tcpzcEndpoint{
 		conn:     conn,
 		usable:   int(conn.Usable()),
@@ -115,35 +124,15 @@ func openTCPZCEndpointFd(fd int, name string) (zeroCopyEndpoint, error) {
 	}
 	e.ctx, e.cancel = context.WithCancel(context.Background())
 
-	// Seed the TX free pool with the high half.
+	// Seed the TX free pool with the high half. (The RX half is already published
+	// to the provided-buffer ring and armed by tcpzc.Open.)
 	for i := rxN; i < count; i++ {
 		e.txFreeCh <- i
-	}
-	// Arm the RX half as recv landing slots.
-	for i := uint32(0); i < rxN; i++ {
-		if perr := conn.PostRecv(i); perr != nil {
-			_ = conn.Close()
-			return nil, perr
-		}
 	}
 
 	e.wg.Add(1)
 	go e.ioLoop()
 	return e, nil
-}
-
-// tcpzcRXCount splits count buffers into RX landing slots (half) and the TX free
-// pool (the rest), clamped so both halves are at least one buffer. Mirrors
-// urpRXCount.
-func tcpzcRXCount(count uint32) uint32 {
-	rx := count / 2
-	if rx < 1 {
-		rx = 1
-	}
-	if rx >= count {
-		rx = count - 1
-	}
-	return rx
 }
 
 // ioLoop owns the ring: drain producer intents (post SENDs / re-arm RECVs), then
@@ -184,7 +173,9 @@ func (e *tcpzcEndpoint) drainIntents() {
 				}
 			}
 		case idx := <-e.reRecvCh:
-			_ = e.conn.PostRecv(idx)
+			// Republish to the provided-buffer ring: a memory write + tail
+			// advance, no SQE and no syscall (the RX batching win).
+			_ = e.conn.ReturnRecvBuf(idx)
 		default:
 			return
 		}
@@ -209,14 +200,35 @@ func (e *tcpzcEndpoint) dispatch(c tcpzc.Completion) {
 		}
 	case tcpzc.ActSendInFlight:
 		// SEND_ZC send acknowledged; buffer still held until the notification.
+	case tcpzc.ActSendCanceled:
+		// An earlier send in this IOSQE_IO_LINK ordering chain failed, so this
+		// one never ran. Reclaim its buffer; the first failure drives teardown.
+		e.conn.Free(c.Idx)
+		select {
+		case e.txFreeCh <- c.Idx:
+		default:
+		}
 	case tcpzc.ActDeliverRecv:
-		e.conn.Free(c.Idx) // Recv -> Free; re-armed on ReRecv
+		e.conn.Free(c.Idx) // app owns it now; ReRecv republishes it to the ring
 		e.deliver(recvEvent{idx: c.Idx, payload: e.conn.Buf(c.Idx)[:length]})
+	case tcpzc.ActRecvRearm:
+		// The multishot arm ended without a stream error (e.g. -ENOBUFS because
+		// the ring momentarily held no buffer). No buffer was delivered and no
+		// bytes were lost — just arm a fresh multishot.
 	case tcpzc.ActRecvError:
 		e.conn.Free(c.Idx)
 		e.deliver(recvEvent{err: errFastEndpointClosed})
 	case tcpzc.ActIgnore:
 		// forged/unknown kind — drop.
+	}
+
+	// Checked INDEPENDENTLY of the action: the final completion of a multishot
+	// arm can both deliver bytes and terminate the arm, so a delivering CQE with
+	// CQEFMore clear still needs a re-arm or RX stops forever.
+	if act != tcpzc.ActRecvError && tcpzc.RecvEndedArm(c.Kind, c.Flags) {
+		if aerr := e.conn.ArmRecvMultishot(); aerr != nil {
+			e.deliver(recvEvent{err: aerr})
+		}
 	}
 }
 
