@@ -38,6 +38,7 @@ package server
 import (
 	"context"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"sync"
@@ -203,15 +204,23 @@ var tcpzcDebug = os.Getenv("NATS_TCPZC_DEBUG") == "1"
 
 // tcpzcDebugInterval is how often a ring reports. One second matches the
 // per-second rates every other tcpzc measurement is quoted in.
-const tcpzcDebugInterval = time.Second
-
+//
 // tcpzcDebugIterMask is how many ioLoop iterations pass between clock reads
 // (2^k-1, tested with &). A spinning loop iterates ~1M times/s and time.Now() is
 // ~25ns, so reading the clock every iteration would itself cost ~2.5% of the core
 // being measured. Every 4096 iterations bounds that at a rounding error while
 // still reporting ~245x per second at spin rates, and at least once per interval
 // at idle (an idle loop still wakes every pollTO).
-const tcpzcDebugIterMask = 4095
+//
+// tcpzcDebugOut is where a line goes. All three are vars, not consts, ONLY so a
+// test can drive a real ring and assert that a line actually lands: the first
+// attempt to validate this on hardware lost a run, and a diagnostic whose output
+// path is unproven is worth nothing (that is the whole lesson of P2e-5k).
+var (
+	tcpzcDebugInterval           = time.Second
+	tcpzcDebugIterMask           = 4095
+	tcpzcDebugOut      io.Writer = os.Stderr
+)
 
 // tcpzcDebugState is one ioLoop's dump bookkeeping. Owned by that goroutine.
 type tcpzcDebugState struct {
@@ -247,14 +256,28 @@ func (e *tcpzcEndpoint) debugTick(d *tcpzcDebugState) {
 	cur := e.conn.Stats()
 	delta := cur.Sub(d.prev)
 	elapsed := tcpzcDebugInterval + now.Sub(d.next)
-	floor := uint64(100000) * uint64(elapsed) / uint64(time.Second)
-	fmt.Fprintf(os.Stderr,
-		"tcpzc-dbg name=%s spin=%s ms=%d enters=%d msgs=%d enobufs=%d armed=%d refused=%d armEnded=%d returned=%d ringAvail=%d isArmed=%v\n",
-		e.name, tcpzc.DiagnoseSpin(delta, floor), elapsed.Milliseconds(),
-		delta.Syscalls, delta.RecvDelivered, delta.RecvENOBUFS, delta.ArmSubmitted,
-		delta.ArmRefused, delta.ArmEnded, delta.BufsReturned, delta.RingAvail, delta.RecvArmed)
+	fmt.Fprint(tcpzcDebugOut, tcpzcDebugLine(e.name, delta, elapsed))
 	d.prev = cur
 	d.next = now.Add(tcpzcDebugInterval)
+}
+
+// tcpzcDebugSpinFloorPerSec is the io_uring_enter rate above which an interval is
+// worth attributing to a mechanism. One tenth of the ~1.07M/s/node a real spin
+// measured on hardware, which is still two orders of magnitude above a healthy
+// route (the clean 3-node tcpzc arm ran ~65k/s/node across all 8 of its rings).
+const tcpzcDebugSpinFloorPerSec = 100000
+
+// tcpzcDebugLine formats one dump line. Pure, so the format and the verdict
+// selection are table-testable without a ring: the interesting field is `spin`,
+// which names the mechanism instead of leaving a wall of numbers to be eyeballed
+// — the thing that was missing when P2e-5k had to be reasoned out by hand.
+func tcpzcDebugLine(name string, delta tcpzc.Stats, elapsed time.Duration) string {
+	floor := uint64(tcpzcDebugSpinFloorPerSec) * uint64(elapsed) / uint64(time.Second)
+	return fmt.Sprintf(
+		"tcpzc-dbg name=%s spin=%s ms=%d enters=%d msgs=%d enobufs=%d armed=%d refused=%d armEnded=%d returned=%d ringAvail=%d isArmed=%v\n",
+		name, tcpzc.DiagnoseSpin(delta, floor), elapsed.Milliseconds(),
+		delta.Syscalls, delta.RecvDelivered, delta.RecvENOBUFS, delta.ArmSubmitted,
+		delta.ArmRefused, delta.ArmEnded, delta.BufsReturned, delta.RingAvail, delta.RecvArmed)
 }
 
 // drainIntents posts every queued Send / ReRecv without blocking. Runs on the

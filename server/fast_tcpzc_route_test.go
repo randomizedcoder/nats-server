@@ -25,8 +25,12 @@ package server
 // restricted sandbox — e.g. it is NOT run by .#ci-local, which has no io_uring).
 
 import (
+	"bytes"
 	"fmt"
+	"net"
 	"os"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -332,4 +336,190 @@ func checkRouteTransport(t *testing.T, s *Server, want string) {
 		}
 		return nil
 	})
+}
+
+// TestTCPZCDebugLine covers the dump's pure formatter and, crucially, the verdict
+// it selects. The verdict is the entire value of the instrument: a wall of counters
+// still has to be interpreted, and interpreting them by hand is what produced
+// P2e-5k. Design 58 P2e-5l.
+func TestTCPZCDebugLine(t *testing.T) {
+	const sec = time.Second
+
+	for _, tc := range []struct {
+		description string
+		name        string
+		delta       tcpzc.Stats
+		elapsed     time.Duration
+		expected    string // substring that must appear
+	}{
+		{
+			description: "POS a quiet route reports no spin",
+			name:        "route-hp2",
+			delta:       tcpzc.Stats{Syscalls: 5000, RecvDelivered: 1200, BufsReturned: 1200, RingAvail: 128, RecvArmed: true},
+			elapsed:     sec,
+			expected:    "tcpzc-dbg name=route-hp2 spin=none ms=1000 enters=5000 msgs=1200",
+		},
+		{
+			description: "POS a hot loop with nothing to show for it is named unattributed, the verdict no profile could give",
+			name:        "route-hp3",
+			delta:       tcpzc.Stats{Syscalls: 1070000, RecvDelivered: 40},
+			elapsed:     sec,
+			expected:    "spin=unattributed",
+		},
+		{
+			description: "POS arms coming straight back as -ENOBUFS with nothing delivered is named",
+			name:        "r",
+			delta:       tcpzc.Stats{Syscalls: 541000, ArmSubmitted: 540000, RecvENOBUFS: 540000, RecvDelivered: 10},
+			elapsed:     sec,
+			expected:    "spin=enobufs-rearm",
+		},
+		{
+			description: "NEG the measured healthy shape -- drowning in -ENOBUFS but carrying >=1 msg per enter -- is NOT a spin",
+			name:        "r",
+			delta:       tcpzc.Stats{Syscalls: 166200, RecvDelivered: 1329133, RecvENOBUFS: 7002800, ArmRefused: 124100},
+			elapsed:     sec,
+			expected:    "spin=none",
+		},
+		{
+			description: "BND an interval just under the attribution floor is not attributed however it is shaped",
+			name:        "r",
+			delta:       tcpzc.Stats{Syscalls: tcpzcDebugSpinFloorPerSec - 1, RecvENOBUFS: tcpzcDebugSpinFloorPerSec - 1},
+			elapsed:     sec,
+			expected:    "spin=none",
+		},
+		{
+			description: "BND the floor scales with elapsed time, so a half-second interval halves it",
+			name:        "r",
+			delta:       tcpzc.Stats{Syscalls: tcpzcDebugSpinFloorPerSec / 2, RecvENOBUFS: tcpzcDebugSpinFloorPerSec / 2},
+			elapsed:     sec / 2,
+			expected:    "spin=enobufs-rearm ms=500",
+		},
+		{
+			description: "COR a starved ring reports its live state so a stall is distinguishable from a spin",
+			name:        "r",
+			delta:       tcpzc.Stats{Syscalls: 5000, RingAvail: 0, RecvArmed: false, ArmRefused: 3},
+			elapsed:     sec,
+			expected:    "ringAvail=0 isArmed=false",
+		},
+	} {
+		t.Run(tc.description, func(t *testing.T) {
+			got := tcpzcDebugLine(tc.name, tc.delta, tc.elapsed)
+			if !strings.Contains(got, tc.expected) {
+				t.Fatalf("%s:\n  got      %q\n  expected to contain %q", tc.description, got, tc.expected)
+			}
+			if !strings.HasSuffix(got, "\n") {
+				t.Fatalf("%s: line is not newline-terminated, so journal lines would run together: %q",
+					tc.description, got)
+			}
+		})
+	}
+}
+
+// TestTCPZCDebugDumpReachesTheSink drives a REAL ring and requires a line to
+// actually land. The formatter being correct is not the risk; the risk is that the
+// gate never fires and the dump stays silent, which is exactly how the first
+// hardware attempt was wasted (the scrape also died of SIGPIPE, and --collect took
+// the journals with it, so nothing could be checked after the fact). Design 58
+// P2e-5l.
+func TestTCPZCDebugDumpReachesTheSink(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer ln.Close()
+
+	type acc struct {
+		c   net.Conn
+		err error
+	}
+	accCh := make(chan acc, 1)
+	go func() {
+		c, aerr := ln.Accept()
+		accCh <- acc{c, aerr}
+	}()
+	dialed, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	a := <-accCh
+	if a.err != nil {
+		t.Fatalf("accept: %v", a.err)
+	}
+
+	dfd, err := ownFdFromConn(dialed)
+	if err != nil {
+		t.Fatalf("own dialed fd: %v", err)
+	}
+	afd, err := ownFdFromConn(a.c)
+	if err != nil {
+		t.Fatalf("own accepted fd: %v", err)
+	}
+
+	// Report every iteration into a buffer, on a short interval, so the test does
+	// not need a second of traffic. Restored before returning.
+	var mu sync.Mutex
+	buf := &lockedBuffer{mu: &mu}
+	origDebug, origIval, origMask, origOut := tcpzcDebug, tcpzcDebugInterval, tcpzcDebugIterMask, tcpzcDebugOut
+	tcpzcDebug, tcpzcDebugInterval, tcpzcDebugIterMask, tcpzcDebugOut = true, 5*time.Millisecond, 0, buf
+	defer func() {
+		tcpzcDebug, tcpzcDebugInterval, tcpzcDebugIterMask, tcpzcDebugOut = origDebug, origIval, origMask, origOut
+	}()
+
+	ep1, err := openTCPZCEndpointFd(dfd, "dbg-dialed")
+	if err != nil {
+		t.Skipf("tcpzc endpoint unavailable here (no io_uring?): %v", err)
+	}
+	defer ep1.Close()
+	ep2, err := openTCPZCEndpointFd(afd, "dbg-accepted")
+	if err != nil {
+		t.Skipf("tcpzc endpoint unavailable here (no io_uring?): %v", err)
+	}
+	defer ep2.Close()
+
+	// A little real traffic, so the counters are not all zero.
+	idx, b, err := ep1.SendBuf()
+	if err != nil {
+		t.Fatalf("SendBuf: %v", err)
+	}
+	copy(b, []byte("PING\r\n"))
+	if err := ep1.Send(idx, 6); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+
+	deadline := time.Now().Add(5 * time.Second)
+	var got string
+	for time.Now().Before(deadline) {
+		if s := buf.String(); strings.Contains(s, "tcpzc-dbg name=dbg-dialed ") {
+			got = s
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if got == "" {
+		t.Fatalf("no tcpzc-dbg line reached the sink in 5s with the dump enabled — the diagnostic is silent, which is worse than absent (buffer: %q)", buf.String())
+	}
+	// It must carry a verdict, or the scrape has nothing to tally.
+	if !strings.Contains(got, "spin=") {
+		t.Fatalf("dump line carries no spin verdict: %q", got)
+	}
+	t.Logf("dump line landed: %s", strings.SplitN(got, "\n", 2)[0])
+}
+
+// lockedBuffer is a bytes.Buffer safe for the ioLoop goroutine to write while the
+// test reads it.
+type lockedBuffer struct {
+	mu *sync.Mutex
+	b  bytes.Buffer
+}
+
+func (l *lockedBuffer) Write(p []byte) (int, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.b.Write(p)
+}
+
+func (l *lockedBuffer) String() string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.b.String()
 }
