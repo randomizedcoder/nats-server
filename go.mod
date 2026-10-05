@@ -19,4 +19,4 @@ require (
 	golang.org/x/time v0.16.0
 )
 
-require github.com/randomizedcoder/giouring v1.1.1 // indirect
+require github.com/randomizedcoder/giouring v1.1.2 // indirect
