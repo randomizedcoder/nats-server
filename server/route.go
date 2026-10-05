@@ -2057,10 +2057,19 @@ func (s *Server) createRoute(conn net.Conn, fc *fastConn, rURL *url.URL, rtype R
 	// If we are creating a pooled connection and this is the server soliciting
 	// the connection, we will delay sending the INFO after we have processed
 	// the incoming INFO from the remote. Also delay if configured for compression.
-	// A fast route never delays INFO: with no compression to negotiate and no
-	// pooling (one endpoint = one point-to-point route), the initial INFO is
-	// always sent immediately over the seam.
-	delayInfo := didSolicit && fc == nil && (compressionConfigured || routeShouldDelayInfo(accName, opts))
+	//
+	// This must NOT be special-cased on fc != nil. A urp fast endpoint is a single
+	// point-to-point connection and so cannot pool, but that is already enforced by
+	// defaulting its Cluster.PoolSize to -1 (see setDefaults), which makes
+	// routeShouldDelayInfo false here; compression is likewise already excluded via
+	// compressionConfigured. A tcpzc route, by contrast, is ordinary TCP and pools
+	// normally. Skipping the delay for it sent an immediate INFO carrying poolIdx 0
+	// for *every* pooled dial, so the accepting side filed them all under slot 0 and
+	// closed all but the first as Duplicate Route; those never got an INFO back,
+	// never answered a PING, and churned Stale Connection -> re-dial forever
+	// (design 58 P2e-5f). processRouteInfo computes sendDelayedInfo without
+	// consulting fc, so skipping the delay here also sent the INFO twice.
+	delayInfo := didSolicit && (compressionConfigured || routeShouldDelayInfo(accName, opts))
 	if !delayInfo {
 		compressionMode := opts.Cluster.Compression.Mode
 		if fc != nil {

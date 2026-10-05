@@ -121,6 +121,122 @@ func TestTCPZCRouteClusterFormsAndCarriesTraffic(t *testing.T) {
 	}
 }
 
+// TestTCPZCRoutePoolEveryMemberCompletes is the design 58 P2e-5f reproduction.
+//
+// The integration test above sets Cluster.PoolSize = -1, so until now NO test had
+// ever run tcpzc with route POOLING — which is the default (DEFAULT_ROUTE_POOL_SIZE
+// = 3) and therefore exactly what the NixOS module and the HW A/B actually ran. On
+// hp1/hp2/hp3 that configuration left one route per remote that never answered a
+// PING (rtt=0s, subs=0), so NATS closed it as a Stale Connection every ~31s and
+// re-dialled forever — 466 stale route connections in 2h7m — and the JetStream
+// drive hung for over two hours.
+//
+// Two assertions matter, and neither exists above. checkClusterFormed counts the
+// routes a pooled cluster is SUPPOSED to have (pool members plus any dedicated
+// account routes), so a member that never completes makes it time out. And a route
+// that completes but then dies has to be caught by watching for longer than the
+// stale deadline, which is why routeMaxPingInterval is shortened here: it is what
+// turns the HW's ~31s churn period into a sub-second one.
+func TestTCPZCRoutePoolEveryMemberCompletes(t *testing.T) {
+	if !tcpzcAvailable(t) {
+		t.Skip("io_uring not available; skipping tcpzc route pool test")
+	}
+
+	// Shorten the route stale deadline (pingInterval * (MaxPingsOut+1)) from ~90s
+	// to ~750ms so the churn is observable inside a test. Restored for the rest of
+	// the package.
+	orgMaxPing := routeMaxPingInterval
+	routeMaxPingInterval = 250 * time.Millisecond
+	defer func() { routeMaxPingInterval = orgMaxPing }()
+
+	for _, tc := range []struct {
+		description     string
+		poolSize        int
+		noSystemAccount bool
+		expected        string
+	}{
+		{
+			description: "POS pooling disabled: the only shape P2e-2 ever tested",
+			poolSize:    -1,
+			expected:    "one route each way, and none of them goes stale",
+		},
+		{
+			description: "NEG default pooling: what the NixOS module and the HW A/B run",
+			poolSize:    0, // -> DEFAULT_ROUTE_POOL_SIZE
+			expected:    "every pool member plus the dedicated $SYS route completes, and none goes stale",
+		},
+		{
+			description: "BND a pool of exactly one",
+			poolSize:    1,
+			expected:    "the single pool member plus the dedicated $SYS route completes, and neither goes stale",
+		},
+		{
+			description:     "COR pooling with no dedicated $SYS route",
+			poolSize:        3,
+			noSystemAccount: true,
+			expected:        "all three pool members complete with no account route, and none goes stale",
+		},
+	} {
+		t.Run(tc.description, func(t *testing.T) {
+			mk := func(name string) *Options {
+				o := DefaultOptions()
+				o.ServerName = name
+				o.Cluster.Name = "tcpzc-pool-test"
+				o.Cluster.Host = "127.0.0.1"
+				o.Cluster.PoolSize = tc.poolSize
+				o.Cluster.TCPZC = true
+				o.NoSystemAccount = tc.noSystemAccount
+				return o
+			}
+
+			optsA := mk("A")
+			srvA := RunServer(optsA)
+			defer srvA.Shutdown()
+
+			optsB := mk("B")
+			optsB.Routes = RoutesFromStr(fmt.Sprintf("nats://127.0.0.1:%d", srvA.ClusterAddr().Port))
+			srvB := RunServer(optsB)
+			defer srvB.Shutdown()
+
+			// Every route the pooled cluster is supposed to have must complete. A
+			// member whose handshake never round-trips never gets counted here.
+			checkClusterFormed(t, srvA, srvB)
+
+			if err := checkRoutesStayUp(srvA, srvB, 3*time.Second); err != nil {
+				t.Fatalf("%s: %v (expected: %s)", tc.description, err, tc.expected)
+			}
+		})
+	}
+}
+
+// checkRoutesStayUp samples the servers for d and fails if any route connection
+// goes stale or the route count moves. A tcpzc route that completes its handshake
+// and then stops answering PINGs looks perfectly healthy the instant after the
+// cluster forms, so only a window longer than the stale deadline can see it.
+func checkRoutesStayUp(srvA, srvB *Server, d time.Duration) error {
+	startA, startB := srvA.NumRoutes(), srvB.NumRoutes()
+	staleA, staleB := srvA.NumStaleConnectionsRoutes(), srvB.NumStaleConnectionsRoutes()
+	deadline := time.Now().Add(d)
+	for time.Now().Before(deadline) {
+		time.Sleep(50 * time.Millisecond)
+		for _, s := range []struct {
+			srv   *Server
+			route int
+			stale uint64
+		}{{srvA, startA, staleA}, {srvB, startB, staleB}} {
+			if got := s.srv.NumStaleConnectionsRoutes(); got != s.stale {
+				return fmt.Errorf("%s: %d route connections went stale (was %d, now %d) — the route is churning",
+					s.srv.Name(), got-s.stale, s.stale, got)
+			}
+			if got := s.srv.NumRoutes(); got != s.route {
+				return fmt.Errorf("%s: route count moved %d -> %d — a route was torn down or re-dialled",
+					s.srv.Name(), s.route, got)
+			}
+		}
+	}
+	return nil
+}
+
 // checkRouteTransport asserts the server has at least one route and that every
 // route reports the given transport name.
 func checkRouteTransport(t *testing.T, s *Server, want string) {
