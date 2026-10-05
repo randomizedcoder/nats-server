@@ -37,7 +37,9 @@ package server
 
 import (
 	"context"
+	"fmt"
 	"net"
+	"os"
 	"sync"
 	"syscall"
 	"time"
@@ -88,6 +90,7 @@ type tcpzcEndpoint struct {
 	conn   *tcpzc.Conn
 	usable int
 	pollTO time.Duration
+	name   string // route name, so a debug dump identifies WHICH ring is hot
 
 	recvCh   chan recvEvent  // ioLoop -> Recv
 	reRecvCh chan uint32     // ReRecv -> ioLoop (re-arm an RX buffer)
@@ -137,6 +140,7 @@ func openTCPZCEndpointFd(fd int, name string) (zeroCopyEndpoint, error) {
 		conn:     conn,
 		usable:   int(conn.Usable()),
 		pollTO:   tcpzcPollTimeoutFromEnv(),
+		name:     name,
 		recvCh:   make(chan recvEvent, rxN),
 		reRecvCh: make(chan uint32, rxN),
 		sendCh:   make(chan sendReq, count-rxN),
@@ -162,6 +166,7 @@ func openTCPZCEndpointFd(fd int, name string) (zeroCopyEndpoint, error) {
 func (e *tcpzcEndpoint) ioLoop() {
 	defer e.wg.Done()
 	dst := make([]tcpzc.Completion, e.conn.Entries())
+	var dbg tcpzcDebugState
 	for {
 		select {
 		case <-e.ctx.Done():
@@ -177,7 +182,79 @@ func (e *tcpzcEndpoint) ioLoop() {
 		for i := 0; i < n; i++ {
 			e.dispatch(dst[i])
 		}
+		if tcpzcDebug {
+			e.debugTick(&dbg)
+		}
 	}
+}
+
+// tcpzcDebug enables the P2e-5l per-ring counter dump on stderr (and so into the
+// unit's journal, which is where the harness can grep it). Read once at startup:
+// the check is on the ioLoop's hottest path, and a spinning loop runs it ~1M
+// times/s, so it must be a plain bool test and nothing more.
+//
+// Why stderr and not /routez: the zeroCopyEndpoint seam deliberately carries no
+// logger and no server reference (that is what makes it transport-neutral and
+// unit-testable), and plumbing one through is a seam redesign that has been
+// deferred since P2e-5g. Two separate re-arm spins have now been found only by
+// reading a CPU profile after the fact, so the diagnosis is worth more than the
+// aesthetics of its delivery. The dump is off unless NATS_TCPZC_DEBUG=1.
+var tcpzcDebug = os.Getenv("NATS_TCPZC_DEBUG") == "1"
+
+// tcpzcDebugInterval is how often a ring reports. One second matches the
+// per-second rates every other tcpzc measurement is quoted in.
+const tcpzcDebugInterval = time.Second
+
+// tcpzcDebugIterMask is how many ioLoop iterations pass between clock reads
+// (2^k-1, tested with &). A spinning loop iterates ~1M times/s and time.Now() is
+// ~25ns, so reading the clock every iteration would itself cost ~2.5% of the core
+// being measured. Every 4096 iterations bounds that at a rounding error while
+// still reporting ~245x per second at spin rates, and at least once per interval
+// at idle (an idle loop still wakes every pollTO).
+const tcpzcDebugIterMask = 4095
+
+// tcpzcDebugState is one ioLoop's dump bookkeeping. Owned by that goroutine.
+type tcpzcDebugState struct {
+	iter int
+	next time.Time
+	prev tcpzc.Stats
+}
+
+// debugTick emits one line per ring per interval:
+//
+//	tcpzc-dbg name=<route> spin=<verdict> enters=N msgs=N enobufs=N armed=N refused=N ...
+//
+// `spin` is tcpzc.DiagnoseSpin over the interval delta — the whole point, because
+// it names the mechanism rather than leaving a wall of numbers to be eyeballed.
+// The floor is one tenth of the ~1.07M enters/s/node a real spin measured on
+// hardware, which is still two orders of magnitude above a healthy route.
+func (e *tcpzcEndpoint) debugTick(d *tcpzcDebugState) {
+	d.iter++
+	if d.iter&tcpzcDebugIterMask != 0 {
+		return
+	}
+	now := time.Now()
+	if d.next.IsZero() {
+		// First visit: start the interval, do not report a delta against a zero
+		// snapshot (it would include everything since Open and read as a spike).
+		d.next = now.Add(tcpzcDebugInterval)
+		d.prev = e.conn.Stats()
+		return
+	}
+	if now.Before(d.next) {
+		return
+	}
+	cur := e.conn.Stats()
+	delta := cur.Sub(d.prev)
+	elapsed := tcpzcDebugInterval + now.Sub(d.next)
+	floor := uint64(100000) * uint64(elapsed) / uint64(time.Second)
+	fmt.Fprintf(os.Stderr,
+		"tcpzc-dbg name=%s spin=%s ms=%d enters=%d msgs=%d enobufs=%d armed=%d refused=%d armEnded=%d returned=%d ringAvail=%d isArmed=%v\n",
+		e.name, tcpzc.DiagnoseSpin(delta, floor), elapsed.Milliseconds(),
+		delta.Syscalls, delta.RecvDelivered, delta.RecvENOBUFS, delta.ArmSubmitted,
+		delta.ArmRefused, delta.ArmEnded, delta.BufsReturned, delta.RingAvail, delta.RecvArmed)
+	d.prev = cur
+	d.next = now.Add(tcpzcDebugInterval)
 }
 
 // drainIntents posts every queued Send / ReRecv without blocking. Runs on the
