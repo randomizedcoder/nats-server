@@ -187,6 +187,21 @@ func (e *tcpzcEndpoint) drainIntents() {
 // terminal send completion (plain CQE or the notification) frees it.
 func (e *tcpzcEndpoint) dispatch(c tcpzc.Completion) {
 	act, length := tcpzc.Classify(c.Kind, c.Flags, c.Res, e.conn.BufSize())
+
+	// Checked BEFORE the action: a send that wrote fewer bytes than were posted
+	// dropped the rest, so the route stream now has a hole and the peer's parser is
+	// misaligned. MSG_WAITALL makes this unreachable, but carrying on would corrupt
+	// silently -- tear the route down instead and let NATS reconnect.
+	if e.conn.SendWasShort(c) {
+		e.conn.Free(c.Idx)
+		select {
+		case e.txFreeCh <- c.Idx:
+		default:
+		}
+		e.deliver(recvEvent{err: errFastEndpointClosed})
+		return
+	}
+
 	switch act {
 	case tcpzc.ActFreeSend:
 		_ = e.conn.Complete(c.Idx) // Send -> Free
