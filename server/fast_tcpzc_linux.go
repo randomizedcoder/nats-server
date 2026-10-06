@@ -470,6 +470,12 @@ func (e *tcpzcEndpoint) BufSize() int { return e.usable }
 // production seams do not require it).
 func (e *tcpzcEndpoint) Completions() <-chan completion { return e.comps }
 
+// RetainBuffers / ReleaseBuffers forward the buffer-pool lifetime contract to the
+// Conn: Recv hands out slices of its mmap'd pool, which must outlive the last
+// holder rather than the owner. See zeroCopyEndpoint and tcpzc.Conn.poolRefs.
+func (e *tcpzcEndpoint) RetainBuffers() bool { return e.conn.PoolRef() }
+func (e *tcpzcEndpoint) ReleaseBuffers()     { e.conn.PoolUnref() }
+
 // Close cancels the ring goroutine, waits for it to exit, then releases the conn
 // (which closes the socket fd). Idempotent.
 func (e *tcpzcEndpoint) Close() error {

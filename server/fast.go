@@ -164,7 +164,32 @@ type zeroCopyEndpoint interface {
 	BufSize() int
 	// Completions is the demuxed OnRecv / OnSendComplete stream.
 	Completions() <-chan completion
-	// Close releases the endpoint; in-flight completions may still drain.
+	// RetainBuffers / ReleaseBuffers bracket a consumer's use of the payload
+	// memory Recv hands out, and they are part of this interface rather than an
+	// optional capability because getting them wrong is a use-after-free, and a
+	// backend that forgets them should fail to compile rather than fail to fault
+	// (design 58 P2e-5o).
+	//
+	// Recv returns a slice INTO the backend's buffer pool. For a backend whose
+	// pool is an mmap released at Close — both of ours — that memory is valid only
+	// while someone holds a retain. Close runs on whichever goroutine noticed the
+	// connection die, which is usually NOT the goroutine parsing a delivered
+	// buffer, so without this the parser reads unmapped memory: observed as a
+	// SIGSEGV in client.parse on a delivered RX buffer, with a page-aligned
+	// pointer, not a Go panic.
+	//
+	// RetainBuffers reports false if the pool is already gone, which means the
+	// caller must stop rather than proceed with memory it cannot be given. Pair
+	// every true with exactly one ReleaseBuffers; Close and the retains are
+	// unordered by design, because the consumer is frequently also the closer
+	// (a parse error tears the connection down from inside the Recv/ReRecv
+	// window), so a Close that waited for the reader would deadlock there. A
+	// backend whose payloads are ordinary Go memory implements these as a true
+	// and a no-op.
+	RetainBuffers() bool
+	ReleaseBuffers()
+	// Close releases the endpoint; in-flight completions may still drain. It does
+	// not necessarily release payload memory — see RetainBuffers.
 	Close() error
 }
 
@@ -225,6 +250,8 @@ func (fc *fastConn) Send(idx, length uint32) error    { return fc.ep.Send(idx, l
 func (fc *fastConn) SendBuf() (uint32, []byte, error) { return fc.ep.SendBuf() }
 func (fc *fastConn) BufSize() int                     { return fc.ep.BufSize() }
 func (fc *fastConn) Completions() <-chan completion   { return fc.ep.Completions() }
+func (fc *fastConn) RetainBuffers() bool              { return fc.ep.RetainBuffers() }
+func (fc *fastConn) ReleaseBuffers()                  { fc.ep.ReleaseBuffers() }
 
 // Close releases the endpoint and signals Closed() exactly once. It is
 // idempotent: teardown may call it more than once (flushAndClose on the RX
@@ -313,20 +340,36 @@ func (c *client) flushOutboundFast() bool {
 
 	var sent int64
 	var flushErr error
-outer:
-	for _, buf := range nb {
-		for _, seg := range planFastSend(buf, sendBufSize, false) {
-			idx, sb, err := fast.SendBuf()
-			if err != nil {
-				flushErr = err
-				break outer
+
+	// Hold the endpoint's buffer pool across this unlocked send window (design 58
+	// P2e-5o). SendBuf hands back a slice INTO that pool and the copy below writes
+	// through it, so this seam is a pool holder exactly as readLoopFast is — a
+	// concurrent Close that released the mapping here would fault on the write
+	// rather than the read, but it is the same bug. A refused retain means the pool
+	// is already gone, so there is nothing to send into: report it as a write error
+	// and let the normal teardown below run, which still recycles the nbPool frames.
+	retained := fast.RetainBuffers()
+	if !retained {
+		flushErr = errFastEndpointClosed
+	} else {
+		defer fast.ReleaseBuffers()
+	}
+	if retained {
+	outer:
+		for _, buf := range nb {
+			for _, seg := range planFastSend(buf, sendBufSize, false) {
+				idx, sb, err := fast.SendBuf()
+				if err != nil {
+					flushErr = err
+					break outer
+				}
+				n := copy(sb, buf[seg.off:seg.off+seg.length])
+				if err := fast.Send(idx, uint32(n)); err != nil {
+					flushErr = err
+					break outer
+				}
+				sent += int64(n)
 			}
-			n := copy(sb, buf[seg.off:seg.off+seg.length])
-			if err := fast.Send(idx, uint32(n)); err != nil {
-				flushErr = err
-				break outer
-			}
-			sent += int64(n)
 		}
 	}
 
@@ -382,6 +425,20 @@ func (c *client) readLoopFast() {
 	fast := c.fast
 	acc := c.acc
 	c.mu.Unlock()
+
+	// Hold the endpoint's payload memory for as long as this loop can be looking
+	// at it (design 58 P2e-5o). Every payload below is a slice into the backend's
+	// buffer pool, and Close runs on whoever noticed the connection die — usually
+	// another goroutine entirely — so without this retain the mapping can be
+	// released while c.parse is reading one. A false means the pool is already
+	// gone: there is nothing left to read, so leave instead of taking a buffer we
+	// cannot be given. The release is deferred rather than paired with ReRecv
+	// because every exit below (parse error, Recv error, re-arm failure) leaves
+	// without re-arming, several of them from inside closeConnection.
+	if !fast.RetainBuffers() {
+		return
+	}
+	defer fast.ReleaseBuffers()
 
 	// Non-websocket parse always uses a single buffer view per iteration.
 	var _bufs [1][]byte

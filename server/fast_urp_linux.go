@@ -316,6 +316,12 @@ func (e *urpEndpoint) BufSize() int { return e.usable }
 // production seams do not require it, so ioLoop only ever offers non-blocking).
 func (e *urpEndpoint) Completions() <-chan completion { return e.comps }
 
+// RetainBuffers / ReleaseBuffers forward the buffer-pool lifetime contract to the
+// Pool: Recv hands out slices of its registered mmap, which must outlive the last
+// holder rather than the owner. See zeroCopyEndpoint and urpfast.Pool.poolRefs.
+func (e *urpEndpoint) RetainBuffers() bool { return e.pool.PoolRef() }
+func (e *urpEndpoint) ReleaseBuffers()     { e.pool.PoolUnref() }
+
 // Close cancels the ring goroutine, waits for it to exit, then releases the
 // pool. Idempotent: the accept supervisor and the RX teardown may both call it.
 func (e *urpEndpoint) Close() error {

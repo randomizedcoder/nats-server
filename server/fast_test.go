@@ -36,6 +36,38 @@ type mockEndpoint struct {
 	recvQ   []uint32
 	comps   chan completion
 	closed  bool
+
+	// retains / releases count the buffer-pool lifetime bracket (design 58
+	// P2e-5o). This endpoint's payloads are ordinary Go slices so nothing can
+	// dangle, but counting them lets a test assert the seam brackets at all.
+	retains  int
+	releases int
+	// retainFails models a pool already released, so RetainBuffers refuses.
+	retainFails bool
+	// sends counts Send calls, i.e. how much actually reached the wire.
+	sends int
+}
+
+func (m *mockEndpoint) RetainBuffers() bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.retainFails {
+		return false
+	}
+	m.retains++
+	return true
+}
+
+func (m *mockEndpoint) counts() (retains, releases, sends int) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.retains, m.releases, m.sends
+}
+
+func (m *mockEndpoint) ReleaseBuffers() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.releases++
 }
 
 func newMockEndpoint(count, bufSize int) *mockEndpoint {
@@ -90,6 +122,7 @@ func (m *mockEndpoint) Send(idx, length uint32) error {
 	}
 	copy(m.bufs[rIdx], m.bufs[idx][:length])
 	m.lens[rIdx] = int(length)
+	m.sends++
 	m.recvQ = append(m.recvQ, rIdx)
 	// The send buffer returns to FREE once the device is done reading it.
 	m.free = append(m.free, idx)
@@ -443,6 +476,44 @@ type recordingEndpoint struct {
 	reArmed int
 	closed  bool
 	comps   chan completion
+
+	// Buffer-pool lifetime bracket (design 58 P2e-5o). retains/releases record
+	// that readLoopFast brackets its whole run; retainFails makes RetainBuffers
+	// report false, modelling a pool already released before the loop started, in
+	// which case the loop must leave without consuming a single buffer.
+	retains     int
+	releases    int
+	retainFails bool
+	// recvs counts buffers actually handed out; see recvCount.
+	recvs int
+}
+
+func (m *recordingEndpoint) RetainBuffers() bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.retainFails {
+		return false
+	}
+	m.retains++
+	return true
+}
+
+func (m *recordingEndpoint) ReleaseBuffers() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.releases++
+}
+
+func (m *recordingEndpoint) retainCount() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.retains
+}
+
+func (m *recordingEndpoint) releaseCount() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.releases
 }
 
 func newRecordingEndpoint(count, bufSize int) *recordingEndpoint {
@@ -495,7 +566,16 @@ func (m *recordingEndpoint) Recv() (uint32, []byte, error) {
 	idx := uint32(m.loaded - len(m.recvQ))
 	buf := m.recvQ[0]
 	m.recvQ = m.recvQ[1:]
+	m.recvs++
 	return idx, buf, nil
+}
+
+// recvCount is how many buffers were actually handed out, which is how a test
+// tells "left before reading anything" from "read and then left".
+func (m *recordingEndpoint) recvCount() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.recvs
 }
 
 func (m *recordingEndpoint) ReRecv(idx uint32) error {
@@ -565,6 +645,133 @@ func TestReadLoopFast(t *testing.T) {
 	if c.state != OP_START {
 		t.Fatalf("parser ended in state %d, expected OP_START", c.state)
 	}
+	// The buffer-pool lifetime bracket (design 58 P2e-5o): held exactly once
+	// across the whole run, released exactly once on the way out.
+	if r, rel := ep.retainCount(), ep.releaseCount(); r != 1 || rel != 1 {
+		t.Fatalf("buffer bracket = %d retains / %d releases, expected 1 / 1", r, rel)
+	}
+}
+
+// TestReadLoopFastBufferLifetimeBracket proves readLoopFast brackets the
+// endpoint's payload memory for its whole run, on every exit path (design 58
+// P2e-5o).
+//
+// This is the seam half of the use-after-munmap fix. Recv hands back a slice into
+// the backend's mmap'd buffer pool, and Close — which unmaps it once the last
+// holder leaves — runs on whichever goroutine noticed the connection die. The
+// retain is what makes "the last holder" include this loop. The exit paths differ
+// in whether they re-arm, whether they close, and whether the closer is this very
+// goroutine, so each one is a row: a release that is missed on any of them leaks
+// the mapping for the life of the process, and a release that happens early is
+// the SIGSEGV this fix removes.
+func TestReadLoopFastBufferLifetimeBracket(t *testing.T) {
+	tests := []struct {
+		description string
+		stream      string
+		retainFails bool
+		// wantRetains / wantReleases are the bracket: both 1 on every path that
+		// runs, both 0 when the retain was refused.
+		wantRetains  int
+		wantReleases int
+		// wantConsumed is whether any recv buffer was taken at all.
+		wantConsumed bool
+		// wantReArmed pins which exit was taken, so no row can pass vacuously: -1
+		// means every consumed buffer was re-armed (the clean drain), 0 means none
+		// was, which only the error exits do.
+		wantReArmed int
+		expected    string
+	}{
+		{
+			description:  "POS clean drain releases exactly once",
+			stream:       "PUB foo 5\r\nhello\r\n",
+			wantRetains:  1,
+			wantReleases: 1,
+			wantConsumed: true,
+			wantReArmed:  -1,
+			expected:     "retained for the run, released on return",
+		},
+		{
+			description:  "NEG retain refused: the loop leaves without taking a buffer",
+			stream:       "PUB foo 5\r\nhello\r\n",
+			retainFails:  true,
+			wantRetains:  0,
+			wantReleases: 0,
+			wantConsumed: false,
+			wantReArmed:  0,
+			expected:     "a pool already released means there is nothing to read, so do not read",
+		},
+		{
+			description:  "BND empty stream: bracketed even though no buffer ever arrives",
+			stream:       "",
+			wantRetains:  1,
+			wantReleases: 1,
+			wantConsumed: false,
+			wantReArmed:  0,
+			expected:     "the release is unconditional, not paired with a delivery",
+		},
+		{
+			description: "COR protocol violation: this goroutine is the closer, and still releases",
+			// Garbage first byte: parse fails, readLoopFast closes the connection
+			// from inside its own Recv/ReRecv window and returns without re-arming.
+			// A Close that waited for the reader would deadlock exactly here.
+			stream:       "\x01bogus\r\n",
+			wantRetains:  1,
+			wantReleases: 1,
+			wantConsumed: true,
+			wantReArmed:  0,
+			expected:     "release happens on the error exit too, and closing from inside the bracket does not hang",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.description, func(t *testing.T) {
+			opts := defaultServerOptions
+			s := New(&opts)
+
+			ep := newRecordingEndpoint(16, 8)
+			ep.retainFails = tc.retainFails
+			if tc.stream != "" {
+				ep.loadStream([]byte(tc.stream))
+			}
+			c := &client{kind: CLIENT, fast: newFastConn(ep, "nats-a")}
+			c.srv = s
+			c.mpay = -1
+			c.msubs = -1
+			c.mcl = MAX_CONTROL_LINE_SIZE
+			c.registerWithAccount(s.globalAccount())
+
+			done := make(chan struct{})
+			go func() {
+				c.readLoopFast()
+				close(done)
+			}()
+			select {
+			case <-done:
+			case <-time.After(2 * time.Second):
+				t.Fatalf("readLoopFast did not return (%s)", tc.expected)
+			}
+
+			if got := ep.retainCount(); got != tc.wantRetains {
+				t.Fatalf("retains = %d, want %d (%s)", got, tc.wantRetains, tc.expected)
+			}
+			if got := ep.releaseCount(); got != tc.wantReleases {
+				t.Fatalf("releases = %d, want %d (%s)", got, tc.wantReleases, tc.expected)
+			}
+			// A refused retain must consume nothing: Recv was never called, which
+			// proves the loop left before it could be handed payload memory.
+			if consumed := ep.recvCount() > 0; consumed != tc.wantConsumed {
+				t.Fatalf("consumed a buffer = %v, want %v (%s)", consumed, tc.wantConsumed, tc.expected)
+			}
+			wantReArmed := tc.wantReArmed
+			if wantReArmed < 0 {
+				wantReArmed = ep.recvCount()
+			}
+			if got := ep.reRecvCount(); got != wantReArmed {
+				t.Fatalf("re-armed %d of %d consumed buffers, want %d — the row did not take the exit it names (%s)",
+					got, ep.recvCount(), wantReArmed, tc.expected)
+			}
+		})
+	}
 }
 
 // TestFlushOutboundFast proves the TX seam drains c.out.nb over a fast endpoint
@@ -613,6 +820,95 @@ func TestFlushOutboundFast(t *testing.T) {
 			}
 			if !bytes.Equal(got, tc.payload) {
 				t.Fatalf("received %d bytes, expected %d (equal=%v)", len(got), len(tc.payload), bytes.Equal(got, tc.payload))
+			}
+		})
+	}
+}
+
+// TestFlushOutboundFastBufferLifetimeBracket proves the TX seam is a buffer-pool
+// holder too, and brackets itself as one (design 58 P2e-5o).
+//
+// readLoopFast is the obvious holder — it parses out of a recv buffer — but
+// flushOutboundFast is equally one: SendBuf hands back a slice into the same pool
+// and the seam copies outbound bytes THROUGH that slice, with c.mu released, on
+// the write-loop goroutine. A Close that unmapped the pool mid-copy would fault on
+// a write instead of a read, which is the same defect wearing different clothes.
+//
+// The refused-retain row additionally pins the failure handling: no bytes may
+// reach the wire, and the pooled outbound frames must still be recycled, because
+// leaking those on an error path would trade a crash for a slow leak.
+func TestFlushOutboundFastBufferLifetimeBracket(t *testing.T) {
+	tests := []struct {
+		description  string
+		retainFails  bool
+		payload      []byte
+		wantRetains  int
+		wantReleases int
+		wantSent     bool
+		expected     string
+	}{
+		{
+			description:  "POS flush retains the pool for the unlocked send window and releases once",
+			payload:      bytes.Repeat([]byte("x"), 300), // two segments, one retain
+			wantRetains:  1,
+			wantReleases: 1,
+			wantSent:     true,
+			expected:     "one bracket per flush, not per send segment",
+		},
+		{
+			description:  "NEG retain refused: nothing is sent and nothing is released",
+			retainFails:  true,
+			payload:      bytes.Repeat([]byte("y"), 300),
+			wantRetains:  0,
+			wantReleases: 0,
+			wantSent:     false,
+			expected:     "a released pool is not written into; the flush reports a write error instead",
+		},
+		{
+			description:  "BND single-segment flush still brackets exactly once",
+			payload:      bytes.Repeat([]byte("z"), 10),
+			wantRetains:  1,
+			wantReleases: 1,
+			wantSent:     true,
+			expected:     "the bracket is per flush regardless of how little is sent",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.description, func(t *testing.T) {
+			opts := defaultServerOptions
+			s := New(&opts)
+
+			ep := newMockEndpoint(16, 256)
+			ep.retainFails = tc.retainFails
+			c := &client{kind: ROUTER, fast: newFastConn(ep, "nats-a")}
+			c.srv = s
+
+			c.mu.Lock()
+			c.queueOutbound(tc.payload)
+			nb := len(c.out.nb)
+			c.flushOutboundFast()
+			// Whatever happened, the pooled outbound frames were handed back.
+			leftover := len(c.out.nb)
+			c.mu.Unlock()
+
+			if nb == 0 {
+				t.Fatalf("queueOutbound produced no frames, nothing was under test (%s)", tc.expected)
+			}
+			if leftover != 0 {
+				t.Fatalf("%d outbound frames left queued, want 0 — the error path must not leak them (%s)",
+					leftover, tc.expected)
+			}
+
+			retains, releases, sends := ep.counts()
+			if retains != tc.wantRetains {
+				t.Fatalf("retains = %d, want %d (%s)", retains, tc.wantRetains, tc.expected)
+			}
+			if releases != tc.wantReleases {
+				t.Fatalf("releases = %d, want %d (%s)", releases, tc.wantReleases, tc.expected)
+			}
+			if sent := sends > 0; sent != tc.wantSent {
+				t.Fatalf("anything sent = %v, want %v (%s)", sent, tc.wantSent, tc.expected)
 			}
 		})
 	}
