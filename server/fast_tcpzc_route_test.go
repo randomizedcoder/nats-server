@@ -283,6 +283,88 @@ func TestTCPZCPollTimeoutFromEnv(t *testing.T) {
 	}
 }
 
+// TestTCPZCWaitNrFromEnv covers the completion-batch knob. It is the knob that
+// decides whether io_uring is batching at all: at 1 the loop asks the kernel to
+// return on the FIRST completion, which measured 0.19-0.27 messages per enter on a
+// three-node cluster -- about five enters per message, strictly worse than a plain
+// read(). The default must stay 1 so the hardware A/B compares against the numbers
+// already recorded, and the library clamps anything too large, so the only thing
+// this parse has to get right is never silently producing 0 (which would mean
+// "non-blocking" and is a different code path entirely). Design 58 P2e-5m.
+func TestTCPZCWaitNrFromEnv(t *testing.T) {
+	for _, tc := range []struct {
+		description string
+		env         string
+		set         bool
+		expected    uint32
+	}{
+		{
+			description: "POS unset keeps the pre-P2e-5m behaviour",
+			set:         false,
+			expected:    tcpzc.DefaultWaitNr,
+		},
+		{
+			description: "POS the batch size the user's thesis names is accepted verbatim",
+			env:         "64",
+			set:         true,
+			expected:    64,
+		},
+		{
+			description: "POS the other named batch size is accepted verbatim",
+			env:         "128",
+			set:         true,
+			expected:    128,
+		},
+		{
+			description: "NEG a non-numeric value falls back rather than disabling the wait",
+			env:         "lots",
+			set:         true,
+			expected:    tcpzc.DefaultWaitNr,
+		},
+		{
+			description: "BND zero is refused: it must not become the non-blocking path",
+			env:         "0",
+			set:         true,
+			expected:    tcpzc.DefaultWaitNr,
+		},
+		{
+			description: "BND one is legal and is the default",
+			env:         "1",
+			set:         true,
+			expected:    1,
+		},
+		{
+			description: "BND a value past any ring depth parses; the library clamps it, not this",
+			env:         "100000",
+			set:         true,
+			expected:    100000,
+		},
+		{
+			description: "COR an empty string is treated as unset",
+			env:         _EMPTY_,
+			set:         true,
+			expected:    tcpzc.DefaultWaitNr,
+		},
+		{
+			description: "COR a negative value falls back (ParseUint rejects the sign)",
+			env:         "-8",
+			set:         true,
+			expected:    tcpzc.DefaultWaitNr,
+		},
+	} {
+		t.Run(tc.description, func(t *testing.T) {
+			if tc.set {
+				t.Setenv("NATS_TCPZC_WAIT_NR", tc.env)
+			} else {
+				os.Unsetenv("NATS_TCPZC_WAIT_NR")
+			}
+			if got := tcpzcWaitNrFromEnv(); got != tc.expected {
+				t.Fatalf("%s: waitNr = %d, expected %d", tc.description, got, tc.expected)
+			}
+		})
+	}
+}
+
 // checkRoutesStayUp samples the servers for d and fails if any route connection
 // goes stale or the route count moves. A tcpzc route that completes its handshake
 // and then stops answering PINGs looks perfectly healthy the instant after the

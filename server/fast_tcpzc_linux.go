@@ -61,17 +61,38 @@ func init() {
 const (
 	tcpzcDefaultBufSize uint32 = 65536
 	tcpzcDefaultCount   uint32 = 256
-	// tcpzcDefaultPollUS is the ioLoop's io_uring_enter wait window. It is a
-	// SAFETY NET, not the latency path: an inbound completion wakes the enter
-	// immediately and a local producer wakes it through the eventfd (design 58
-	// P2e-5c), so a longer window costs little latency while cutting the IDLE
-	// wakeup rate proportionally. That matters because NATS runs one ring -- and
-	// so one of these loops -- per ROUTE, and a server holds pool_size x peers
-	// routes (8 per node on a 3-node cluster), so idle polling is multiplied by
-	// the cluster and lands straight in the syscalls/msg metric this work is
-	// judged on. Override with NATS_TCPZC_POLL_US to sweep it.
+	// tcpzcDefaultPollUS is the ioLoop's io_uring_enter wait window.
+	//
+	// It was documented here as "a SAFETY NET, not the latency path: an inbound
+	// completion wakes the enter immediately", on the reasoning that a longer window
+	// costs little latency while cutting the idle wakeup rate proportionally. That
+	// reasoning was measured and it is wrong in BOTH halves (design 58 P2e-5l/5m):
+	// raising the window 25x (200µs -> 5ms) barely moved the enter rate at all
+	// (1,294,105 -> 1,245,657 per node), because at waitNr=1 the window is hardly
+	// ever reached. Every completion, and every local Send/ReRecv through the wake
+	// flag, ends the wait at once -- so the loop spins at the message rate and never
+	// accumulates a batch. Measured on hardware: 0.19-0.27 messages per enter, about
+	// five enters PER message.
+	//
+	// The window only becomes the latency path once the loop actually waits, which is
+	// what NATS_TCPZC_WAIT_NR turns on. Sweep the two together; neither default moves
+	// without a hardware A/B. Override with NATS_TCPZC_POLL_US.
 	tcpzcDefaultPollUS uint32 = 200
 )
+
+// tcpzcWaitNrFromEnv resolves how many completions one io_uring_enter waits for,
+// from NATS_TCPZC_WAIT_NR. The default is tcpzc.DefaultWaitNr (1), which is
+// byte-identical to every tcpzc measurement taken before design 58 P2e-5m: the
+// knob exists to be swept on hardware, not to change behaviour on arrival.
+//
+// Above 1 the loop genuinely waits for a batch, bounded by the poll window, and the
+// window stops being an idle safety net and becomes the latency budget -- see
+// tcpzcDefaultPollUS and tcpzc.DefaultWaitNr. The library clamps the value to what
+// the ring can satisfy (tcpzc.WaitNrFor), so an over-large setting degrades to the
+// ring depth rather than hanging on a wait that can never complete.
+func tcpzcWaitNrFromEnv() uint32 {
+	return envUint32("NATS_TCPZC_WAIT_NR", tcpzc.DefaultWaitNr)
+}
 
 // tcpzcPollTimeoutFromEnv resolves the ioLoop's wait window from
 // NATS_TCPZC_POLL_US. envUint32 already rejects a non-numeric or zero value, and
@@ -91,6 +112,7 @@ type tcpzcEndpoint struct {
 	conn   *tcpzc.Conn
 	usable int
 	pollTO time.Duration
+	waitNr uint32 // completions one enter waits for; see tcpzcWaitNrFromEnv
 	name   string // route name, so a debug dump identifies WHICH ring is hot
 
 	recvCh   chan recvEvent  // ioLoop -> Recv
@@ -141,6 +163,7 @@ func openTCPZCEndpointFd(fd int, name string) (zeroCopyEndpoint, error) {
 		conn:     conn,
 		usable:   int(conn.Usable()),
 		pollTO:   tcpzcPollTimeoutFromEnv(),
+		waitNr:   tcpzcWaitNrFromEnv(),
 		name:     name,
 		recvCh:   make(chan recvEvent, rxN),
 		reRecvCh: make(chan uint32, rxN),
@@ -175,7 +198,7 @@ func (e *tcpzcEndpoint) ioLoop() {
 		default:
 		}
 		e.drainIntents()
-		n, err := e.conn.PollOnce(dst, e.pollTO)
+		n, err := e.conn.PollBatch(dst, e.waitNr, e.pollTO)
 		if err != nil {
 			e.closeOnce.Do(e.cancel)
 			return
