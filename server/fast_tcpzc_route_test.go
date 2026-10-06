@@ -483,6 +483,59 @@ func TestTCPZCDebugLine(t *testing.T) {
 			elapsed:     sec,
 			expected:    "ringAvail=0 isArmed=false",
 		},
+		// --- TX / zero-copy reporting (design 58 P2e-5n) ------------------------
+		{
+			description: "POS an all-small-frame route reports 0% of bytes zero-copy, which was silently true of every benchmark before this field existed",
+			name:        "r",
+			delta: tcpzc.Stats{Syscalls: 5000, RecvDelivered: 1200,
+				SendsPlain: 1200, TxBytesPlain: 1200 * 300},
+			elapsed:  sec,
+			expected: "txSends=1200 zcSends=0 txBytes=360000 zcBytes=0 notifs=0 zcPctBytes=0.0",
+		},
+		{
+			description: "POS a large-frame route reports its bytes as zero-copy with one notif per send",
+			name:        "r",
+			delta: tcpzc.Stats{Syscalls: 2000, RecvDelivered: 500,
+				SendsZC: 500, TxBytesZC: 500 * 65536, NotifsReaped: 500},
+			elapsed:  sec,
+			expected: "txSends=500 zcSends=500 txBytes=32768000 zcBytes=32768000 notifs=500 zcPctBytes=100.0",
+		},
+		{
+			description: "COR the byte share and the send share disagree, which is why bytes are the headline",
+			name:        "r",
+			// 100 small sends and 10 large ones: 9% of SENDS are zero-copy while
+			// over 99% of BYTES are. Reporting only send counts would read as a
+			// route that barely used the zero-copy path.
+			delta: tcpzc.Stats{Syscalls: 1000,
+				SendsPlain: 100, TxBytesPlain: 100 * 200,
+				SendsZC: 10, TxBytesZC: 10 * 65536, NotifsReaped: 10},
+			elapsed:  sec,
+			expected: "txSends=110 zcSends=10 txBytes=675360 zcBytes=655360 notifs=10 zcPctBytes=97.0",
+		},
+		{
+			description: "NEG a zero-copy send whose notification never came leaves a visible gap, the shape of a pinned TX buffer",
+			name:        "r",
+			delta: tcpzc.Stats{Syscalls: 1000,
+				SendsZC: 500, TxBytesZC: 500 * 8192, NotifsReaped: 300},
+			elapsed:  sec,
+			expected: "zcSends=500 txBytes=4096000 zcBytes=4096000 notifs=300",
+		},
+		{
+			description: "BND an idle interval posts no bytes and must not divide by zero",
+			name:        "r",
+			delta:       tcpzc.Stats{Syscalls: 10},
+			elapsed:     sec,
+			expected:    "txSends=0 zcSends=0 txBytes=0 zcBytes=0 notifs=0 zcPctBytes=0.0",
+		},
+		{
+			description: "BND a single byte below the share rounds to 100.0 but keeps the raw counts exact",
+			name:        "r",
+			delta: tcpzc.Stats{Syscalls: 10,
+				SendsPlain: 1, TxBytesPlain: 1,
+				SendsZC: 1, TxBytesZC: 1 << 20, NotifsReaped: 1},
+			elapsed:  sec,
+			expected: "txBytes=1048577 zcBytes=1048576 notifs=1 zcPctBytes=100.0",
+		},
 	} {
 		t.Run(tc.description, func(t *testing.T) {
 			got := tcpzcDebugLine(tc.name, tc.delta, tc.elapsed)

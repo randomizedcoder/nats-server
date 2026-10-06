@@ -294,13 +294,30 @@ const tcpzcDebugSpinFloorPerSec = 100000
 // selection are table-testable without a ring: the interesting field is `spin`,
 // which names the mechanism instead of leaving a wall of numbers to be eyeballed
 // — the thing that was missing when P2e-5k had to be reasoned out by hand.
+//
+// The TX fields (design 58 P2e-5n) answer the other question the dump could not:
+// `zcSends`/`zcBytes` against `txSends`/`txBytes` is whether IORING_OP_SEND_ZC ran
+// at all over the interval, and `zcPctBytes` is the share of bytes that took it.
+// Bytes, not sends, are what zero copy saves, so the byte share is the headline
+// and the send counts are there to show how differently the two can read.
+// `notifs` must track `zcSends`: each SEND_ZC owes exactly one notification and
+// that notification is what releases the buffer, so a standing gap is TX buffers
+// pinned forever.
 func tcpzcDebugLine(name string, delta tcpzc.Stats, elapsed time.Duration) string {
 	floor := uint64(tcpzcDebugSpinFloorPerSec) * uint64(elapsed) / uint64(time.Second)
+	txSends := delta.SendsPlain + delta.SendsZC
+	txBytes := delta.TxBytesPlain + delta.TxBytesZC
+	zcPct := 0.0
+	if txBytes > 0 {
+		zcPct = 100 * float64(delta.TxBytesZC) / float64(txBytes)
+	}
 	return fmt.Sprintf(
-		"tcpzc-dbg name=%s spin=%s ms=%d enters=%d msgs=%d enobufs=%d armed=%d refused=%d armEnded=%d returned=%d ringAvail=%d isArmed=%v\n",
+		"tcpzc-dbg name=%s spin=%s ms=%d enters=%d msgs=%d enobufs=%d armed=%d refused=%d armEnded=%d returned=%d ringAvail=%d isArmed=%v"+
+			" txSends=%d zcSends=%d txBytes=%d zcBytes=%d notifs=%d zcPctBytes=%.1f\n",
 		name, tcpzc.DiagnoseSpin(delta, floor), elapsed.Milliseconds(),
 		delta.Syscalls, delta.RecvDelivered, delta.RecvENOBUFS, delta.ArmSubmitted,
-		delta.ArmRefused, delta.ArmEnded, delta.BufsReturned, delta.RingAvail, delta.RecvArmed)
+		delta.ArmRefused, delta.ArmEnded, delta.BufsReturned, delta.RingAvail, delta.RecvArmed,
+		txSends, delta.SendsZC, txBytes, delta.TxBytesZC, delta.NotifsReaped, zcPct)
 }
 
 // drainIntents posts every queued Send / ReRecv without blocking. Runs on the
