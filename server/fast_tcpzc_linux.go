@@ -94,6 +94,36 @@ func tcpzcWaitNrFromEnv() uint32 {
 	return envUint32("NATS_TCPZC_WAIT_NR", tcpzc.DefaultWaitNr)
 }
 
+// tcpzcMaxSendChainFromEnv resolves the TX chain cap from
+// NATS_TCPZC_MAX_SEND_CHAIN. The default is tcpzc.DefaultMaxSendChain (1), which
+// is a CORRECTNESS default, not a tuning one: design 58 P2e-5q measured that an
+// IOSQE_IO_LINK chain of two or more sends on a TCP socket can deliver the byte
+// stream OUT OF ORDER, at 12-28% of runs, whenever payload sizes are mixed --
+// both directions busy on one ring raises the rate sharply but is not required
+// (P2e-5r). That is what wedged the JetStream RAFT catchup on hardware: the
+// leader logged the transfer complete in 2ms while the follower could never
+// apply it.
+//
+// The cap at 1 is a 40-50x improvement and NOT a complete fix: with the chain
+// capped but sends still pipelined, P2e-5r measured 5 corruptions in 1000 runs
+// (0.50%) against 0/1000 with one send in flight at a time.
+//
+// Unlike NATS_TCPZC_WAIT_NR, raising this knob does not trade latency for
+// throughput -- it REINTRODUCES stream corruption. It exists so the open
+// kernel-level question (does a chain mixing inline-completable sends with ones
+// punted to io-wq lose its ordering, and is that a kernel bug or a misuse of
+// IOSQE_IO_LINK with MSG_WAITALL?) can be reproduced on hardware on demand. Do
+// not raise it to go faster.
+//
+// What the cap costs is bounded and measured: chain length follows SEGMENTS PER
+// MESSAGE, so small NATS messages were already chains of one (P2e-5m measured the
+// hardware batch factor at 0.19-0.27 msgs/enter), and the cost lands only on
+// multi-segment bulk -- about one extra io_uring_enter per 64 KiB, ~1,900/s at the
+// design-53 bulk JS R3 ceiling, against a workload bound by RAFT quorum + fsync.
+func tcpzcMaxSendChainFromEnv() uint32 {
+	return envUint32("NATS_TCPZC_MAX_SEND_CHAIN", tcpzc.DefaultMaxSendChain)
+}
+
 // tcpzcPollTimeoutFromEnv resolves the ioLoop's wait window from
 // NATS_TCPZC_POLL_US. envUint32 already rejects a non-numeric or zero value, and
 // zero must stay rejected here: PollOnce treats timeout <= 0 as "non-blocking",
@@ -154,6 +184,7 @@ func openTCPZCEndpointFd(fd int, name string) (zeroCopyEndpoint, error) {
 		Count:              count,
 		RXCount:            rxN,
 		SmallSendThreshold: envUint32("NATS_TCPZC_ZC_THRESHOLD", tcpzc.DefaultSmallSendThreshold),
+		MaxSendChain:       tcpzcMaxSendChainFromEnv(),
 	})
 	if err != nil {
 		return nil, err
