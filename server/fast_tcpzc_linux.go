@@ -226,6 +226,7 @@ func openTCPZCEndpointFd(fd int, name string) (zeroCopyEndpoint, error) {
 		SmallSendThreshold: envUint32("NATS_TCPZC_ZC_THRESHOLD", tcpzc.DefaultSmallSendThreshold),
 		MaxSendChain:       tcpzcMaxSendChainFromEnv(),
 		MaxSendsInFlight:   tcpzcMaxSendsInFlightFromEnv(),
+		VerifyTxBuffers:    tcpzcTxGuard,
 	})
 	if err != nil {
 		return nil, err
@@ -297,6 +298,35 @@ func (e *tcpzcEndpoint) ioLoop() {
 // aesthetics of its delivery. The dump is off unless NATS_TCPZC_DEBUG=1.
 var tcpzcDebug = os.Getenv("NATS_TCPZC_DEBUG") == "1"
 
+// tcpzcTxGuard turns on the library's TX BUFFER GUARD (design 58 P2e-5w) via
+// NATS_TCPZC_TX_GUARD=1. OFF by default: it costs a shadow copy of the whole
+// buffer pool plus a memcpy per send, and it perturbs timing.
+//
+// It exists to split P2e-5u's remaining question in two with a measurement
+// rather than an argument. P2e-5u proved IORING_OP_SEND_ZC corrupts the route
+// stream on hardware (5/6 runs vs 0/6 with zero copy off, p = 0.0076) and that
+// the peer's parser sees a MID-PAYLOAD byte wrong with the declared length
+// intact. Either WE changed the buffer while the kernel still owned it, or the
+// bytes left this process intact and the fault is below us. The guard answers
+// which: run it with NATS_TCPZC_ZC_THRESHOLD=4096 (zero copy back on) and
+// NATS_TCPZC_DEBUG=1, and read txGuardFailed in the dump against the harness's
+// NATS_ROUTE_INTEGRITY verdict.
+//
+//	txGuardFailed > 0                  -> our bug, in userspace, and the dump
+//	                                      names the buffer and the offset
+//	txGuardFailed == 0 while the peer
+//	rejects the stream                 -> the bytes left us intact; the
+//	                                      corruption is in the kernel, the
+//	                                      driver or the NIC's DMA read, which is
+//	                                      what justifies a kernel trace and an
+//	                                      upstream report instead of a suspicion
+//
+// A clean run under the guard is NOT by itself exoneration: the defect is
+// timing-dependent and the guard changes timing. Read it alongside the integrity
+// verdict for the SAME run, and only a run that corrupts while the guard stays
+// clean carries the second conclusion.
+var tcpzcTxGuard = os.Getenv("NATS_TCPZC_TX_GUARD") == "1"
+
 // tcpzcDebugInterval is how often a ring reports. One second matches the
 // per-second rates every other tcpzc measurement is quoted in.
 //
@@ -322,6 +352,10 @@ type tcpzcDebugState struct {
 	iter int
 	next time.Time
 	prev tcpzc.Stats
+	// guardReported makes the full TX_GUARD_FAILED report fire once per endpoint
+	// rather than once per interval: a route whose every send is corrupting would
+	// otherwise emit it every second for the life of the run.
+	guardReported bool
 }
 
 // debugTick emits one line per ring per interval:
@@ -352,6 +386,20 @@ func (e *tcpzcEndpoint) debugTick(d *tcpzcDebugState) {
 	delta := cur.Sub(d.prev)
 	elapsed := tcpzcDebugInterval + now.Sub(d.next)
 	fmt.Fprint(tcpzcDebugOut, tcpzcDebugLine(e.name, delta, elapsed))
+	// The TX guard's counter says a buffer changed; this says WHICH and WHERE,
+	// which is the whole diagnostic value (design 58 P2e-5w). Emitted ONCE per
+	// endpoint, on the first interval that shows a failure, because the first
+	// failure is the one that happened before any downstream damage and because a
+	// corrupting route would otherwise fill the journal. The offset is directly
+	// comparable with the byte offset the peer's parser error reports.
+	if !d.guardReported && delta.TxGuardFailed > 0 {
+		if f := e.conn.TxGuardFirstFailure(); f != nil {
+			d.guardReported = true
+			fmt.Fprintf(tcpzcDebugOut,
+				"tcpzc-dbg name=%s TX_GUARD_FAILED idx=%d len=%d offset=%d zeroCopy=%v want=%x got=%x\n",
+				e.name, f.Idx, f.Length, f.Offset, f.ZeroCopy, f.Want, f.Got)
+		}
+	}
 	d.prev = cur
 	d.next = now.Add(tcpzcDebugInterval)
 }
@@ -387,6 +435,12 @@ const tcpzcDebugSpinFloorPerSec = 100000
 // each send costs. `chained` (Stats.TxSubmits) must read 0 at the shipped default
 // because a gate of one never leaves a second send to link; a nonzero value means
 // the chain cap was widened.
+//
+// `txGuardChecked`/`txGuardFailed` (design 58 P2e-5w) are zero unless
+// NATS_TCPZC_TX_GUARD=1 -- see tcpzcTxGuard for what each outcome licenses, and
+// note that `txGuardChecked == 0` means the guard was OFF, not that it passed.
+// A failure is followed by one TX_GUARD_FAILED line carrying the buffer, the
+// posted length, the first differing offset and both byte windows.
 func tcpzcDebugLine(name string, delta tcpzc.Stats, elapsed time.Duration) string {
 	floor := uint64(tcpzcDebugSpinFloorPerSec) * uint64(elapsed) / uint64(time.Second)
 	txSends := delta.SendsPlain + delta.SendsZC
@@ -397,12 +451,14 @@ func tcpzcDebugLine(name string, delta tcpzc.Stats, elapsed time.Duration) strin
 	}
 	return fmt.Sprintf(
 		"tcpzc-dbg name=%s spin=%s ms=%d enters=%d msgs=%d enobufs=%d armed=%d refused=%d armEnded=%d returned=%d ringAvail=%d isArmed=%v"+
-			" txSends=%d zcSends=%d txBytes=%d zcBytes=%d notifs=%d zcPctBytes=%.1f gated=%d chained=%d\n",
+			" txSends=%d zcSends=%d txBytes=%d zcBytes=%d notifs=%d zcPctBytes=%.1f gated=%d chained=%d"+
+			" txGuardChecked=%d txGuardFailed=%d\n",
 		name, tcpzc.DiagnoseSpin(delta, floor), elapsed.Milliseconds(),
 		delta.Syscalls, delta.RecvDelivered, delta.RecvENOBUFS, delta.ArmSubmitted,
 		delta.ArmRefused, delta.ArmEnded, delta.BufsReturned, delta.RingAvail, delta.RecvArmed,
 		txSends, delta.SendsZC, txBytes, delta.TxBytesZC, delta.NotifsReaped, zcPct,
-		delta.TxGated, delta.TxSubmits)
+		delta.TxGated, delta.TxSubmits,
+		delta.TxGuardChecked, delta.TxGuardFailed)
 }
 
 // drainIntents posts every queued Send / ReRecv without blocking. Runs on the

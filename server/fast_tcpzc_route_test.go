@@ -568,6 +568,49 @@ func TestTCPZCDebugLine(t *testing.T) {
 			elapsed:     sec,
 			expected:    "zcPctBytes=0.0 gated=0 chained=0",
 		},
+		// --- TX buffer guard reporting (design 58 P2e-5w) ----------------------
+		{
+			description: "NEG the guard OFF reports txGuardChecked=0, which must not be read as a pass -- it means nothing was checked",
+			name:        "r",
+			delta: tcpzc.Stats{Syscalls: 5000, RecvDelivered: 1200,
+				SendsZC: 1200, TxBytesZC: 1200 * 65536, NotifsReaped: 1200},
+			elapsed:  sec,
+			expected: "txGuardChecked=0 txGuardFailed=0",
+		},
+		{
+			description: "POS the guard ON and clean: every released buffer still held the bytes we posted, so the corruption is not ours",
+			name:        "r",
+			delta: tcpzc.Stats{Syscalls: 5000, RecvDelivered: 1200,
+				SendsZC: 1200, TxBytesZC: 1200 * 65536, NotifsReaped: 1200,
+				TxGuardChecked: 1200},
+			elapsed:  sec,
+			expected: "txGuardChecked=1200 txGuardFailed=0",
+		},
+		{
+			description: "POS the guard ON and FAILING: we changed a buffer the kernel still owned, so the fix is in userspace",
+			name:        "r",
+			delta: tcpzc.Stats{Syscalls: 5000, RecvDelivered: 1200,
+				SendsZC: 1200, TxBytesZC: 1200 * 65536, NotifsReaped: 1200,
+				TxGuardChecked: 1200, TxGuardFailed: 3},
+			elapsed:  sec,
+			expected: "txGuardChecked=1200 txGuardFailed=3",
+		},
+		{
+			description: "BND a single failure in a large interval must still be visible, since one corrupted route payload is enough to kill a route",
+			name:        "r",
+			delta: tcpzc.Stats{Syscalls: 500000, RecvDelivered: 300000,
+				SendsZC: 300000, TxBytesZC: 300000 * 65536, NotifsReaped: 300000,
+				TxGuardChecked: 300000, TxGuardFailed: 1},
+			elapsed:  sec,
+			expected: "txGuardChecked=300000 txGuardFailed=1",
+		},
+		{
+			description: "COR failures without checks cannot happen, but must still print rather than be silently dropped by a conditional format",
+			name:        "r",
+			delta:       tcpzc.Stats{Syscalls: 10, TxGuardFailed: 7},
+			elapsed:     sec,
+			expected:    "txGuardChecked=0 txGuardFailed=7",
+		},
 	} {
 		t.Run(tc.description, func(t *testing.T) {
 			got := tcpzcDebugLine(tc.name, tc.delta, tc.elapsed)
