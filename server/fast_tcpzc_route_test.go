@@ -536,6 +536,38 @@ func TestTCPZCDebugLine(t *testing.T) {
 			elapsed:  sec,
 			expected: "txBytes=1048577 zcBytes=1048576 notifs=1 zcPctBytes=100.0",
 		},
+		// --- ordering-cap reporting (design 58 P2e-5u) --------------------------
+		{
+			description: "BND a route whose sends never overlap reports gated=0, which means the ordering gate NEVER ENGAGED and so cannot explain a stream that corrupts anyway",
+			name:        "r",
+			delta: tcpzc.Stats{Syscalls: 5000, RecvDelivered: 1200,
+				SendsPlain: 1200, TxBytesPlain: 1200 * 300},
+			elapsed:  sec,
+			expected: "gated=0 chained=0",
+		},
+		{
+			description: "POS a route offered a second send while the first was still executing reports the refusals, so the gate's cost is read rather than argued",
+			name:        "r",
+			delta: tcpzc.Stats{Syscalls: 5000, RecvDelivered: 1200,
+				SendsPlain: 1200, TxBytesPlain: 1200 * 300, TxGated: 400},
+			elapsed:  sec,
+			expected: "gated=400 chained=0",
+		},
+		{
+			description: "COR a nonzero chained count can only mean the chain cap was widened, since a gate of one never leaves a second send to link",
+			name:        "r",
+			delta: tcpzc.Stats{Syscalls: 5000, RecvDelivered: 1200,
+				SendsPlain: 1200, TxBytesPlain: 1200 * 300, TxGated: 9, TxSubmits: 17},
+			elapsed:  sec,
+			expected: "gated=9 chained=17",
+		},
+		{
+			description: "BND an idle interval reports both caps as zero and must not omit the fields, or a quiet route would be indistinguishable from a binary built before they existed",
+			name:        "r",
+			delta:       tcpzc.Stats{Syscalls: 10},
+			elapsed:     sec,
+			expected:    "zcPctBytes=0.0 gated=0 chained=0",
+		},
 	} {
 		t.Run(tc.description, func(t *testing.T) {
 			got := tcpzcDebugLine(tc.name, tc.delta, tc.elapsed)

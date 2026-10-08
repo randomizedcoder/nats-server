@@ -375,6 +375,18 @@ const tcpzcDebugSpinFloorPerSec = 100000
 // `notifs` must track `zcSends`: each SEND_ZC owes exactly one notification and
 // that notification is what releases the buffer, so a standing gap is TX buffers
 // pinned forever.
+//
+// `gated` and `chained` (design 58 P2e-5u) answer whether the two ordering caps
+// are DOING anything on this traffic, which is a different question from whether
+// they are configured. `gated` counts ErrTxBusy refusals: zero means no second
+// send was ever offered while the first was still executing, so the gate never
+// engaged and cannot explain a stream that corrupts anyway — the P2e-5s residual
+// mechanism simply is not present in that interval, and any corruption alongside
+// it is a THIRD effect rather than an insufficient gate. Nonzero means the gate
+// is holding sends back, and the count over txSends is the extra ring iterations
+// each send costs. `chained` (Stats.TxSubmits) must read 0 at the shipped default
+// because a gate of one never leaves a second send to link; a nonzero value means
+// the chain cap was widened.
 func tcpzcDebugLine(name string, delta tcpzc.Stats, elapsed time.Duration) string {
 	floor := uint64(tcpzcDebugSpinFloorPerSec) * uint64(elapsed) / uint64(time.Second)
 	txSends := delta.SendsPlain + delta.SendsZC
@@ -385,11 +397,12 @@ func tcpzcDebugLine(name string, delta tcpzc.Stats, elapsed time.Duration) strin
 	}
 	return fmt.Sprintf(
 		"tcpzc-dbg name=%s spin=%s ms=%d enters=%d msgs=%d enobufs=%d armed=%d refused=%d armEnded=%d returned=%d ringAvail=%d isArmed=%v"+
-			" txSends=%d zcSends=%d txBytes=%d zcBytes=%d notifs=%d zcPctBytes=%.1f\n",
+			" txSends=%d zcSends=%d txBytes=%d zcBytes=%d notifs=%d zcPctBytes=%.1f gated=%d chained=%d\n",
 		name, tcpzc.DiagnoseSpin(delta, floor), elapsed.Milliseconds(),
 		delta.Syscalls, delta.RecvDelivered, delta.RecvENOBUFS, delta.ArmSubmitted,
 		delta.ArmRefused, delta.ArmEnded, delta.BufsReturned, delta.RingAvail, delta.RecvArmed,
-		txSends, delta.SendsZC, txBytes, delta.TxBytesZC, delta.NotifsReaped, zcPct)
+		txSends, delta.SendsZC, txBytes, delta.TxBytesZC, delta.NotifsReaped, zcPct,
+		delta.TxGated, delta.TxSubmits)
 }
 
 // drainIntents posts every queued Send / ReRecv without blocking. Runs on the
