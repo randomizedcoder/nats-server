@@ -37,6 +37,7 @@ package server
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -115,13 +116,45 @@ func tcpzcWaitNrFromEnv() uint32 {
 // IOSQE_IO_LINK with MSG_WAITALL?) can be reproduced on hardware on demand. Do
 // not raise it to go faster.
 //
-// What the cap costs is bounded and measured: chain length follows SEGMENTS PER
-// MESSAGE, so small NATS messages were already chains of one (P2e-5m measured the
-// hardware batch factor at 0.19-0.27 msgs/enter), and the cost lands only on
-// multi-segment bulk -- about one extra io_uring_enter per 64 KiB, ~1,900/s at the
-// design-53 bulk JS R3 ceiling, against a workload bound by RAFT quorum + fsync.
+// The cap itself costs no syscalls: not linking two SQEs does not mean submitting
+// them separately, so a drain of 15 segments is still one io_uring_enter. What it
+// gives up is the kernel-enforced order within that submission, which is why
+// NATS_TCPZC_MAX_SENDS_IN_FLIGHT (which does cost enters) is the other half of the
+// fix. Chain length follows SEGMENTS PER MESSAGE in any case, so small NATS
+// messages were already chains of one -- P2e-5m measured the hardware batch factor
+// at 0.19-0.27 msgs/enter, i.e. TX chaining was delivering nothing at steady state.
 func tcpzcMaxSendChainFromEnv() uint32 {
 	return envUint32("NATS_TCPZC_MAX_SEND_CHAIN", tcpzc.DefaultMaxSendChain)
+}
+
+// tcpzcMaxSendsInFlightFromEnv resolves the send ORDERING GATE from
+// NATS_TCPZC_MAX_SENDS_IN_FLIGHT. The default is tcpzc.DefaultMaxSendsInFlight
+// (1) and it is the half of the design 58 P2e-5q fix the chain cap does not
+// deliver: with the chain capped, sends in separate submissions executing
+// concurrently on one socket STILL reorder the stream, measured at 5/1000 runs
+// against 0/1000 gated (P2e-5r/5s).
+//
+// The same warning as the chain cap applies, more sharply: raising this does not
+// trade latency for throughput, it reintroduces a stream-corruption class whose
+// symptom on hardware is a JetStream catchup that never applies. Do not raise it
+// to go faster.
+//
+// What the gate costs, and why it is affordable here. It opens on the SEND RESULT
+// (the bytes are queued on the socket), not on the SEND_ZC notification, so it
+// does NOT wait for the kernel to release the buffer and is not RTT-bound. A
+// multi-segment message walks its segments one ring iteration -- so one extra
+// io_uring_enter -- at a time: a 960 KiB route write is 15 iterations rather than
+// one drain, about 1,900 extra enters/s at the design-53 bulk JS R3 ceiling of
+// ~90-118 MiB/s, against a workload bound by RAFT quorum + fsync. Single-segment NATS
+// messages, which P2e-5m measured as the overwhelming majority of route traffic
+// (batch factor 0.19-0.27 msgs/enter), are unaffected in ordering terms.
+// Throughput is not the binding constraint either — one 64 KiB segment per
+// iteration at a few microseconds per iteration sits far above the design-53 bulk
+// JS R3 ceiling of ~90-118 MiB/s, which is RAFT-quorum and fsync bound.
+// tcpzc.Stats.TxGated counts the refusals, so what the gate actually costs on
+// hardware is measured rather than argued.
+func tcpzcMaxSendsInFlightFromEnv() uint32 {
+	return envUint32("NATS_TCPZC_MAX_SENDS_IN_FLIGHT", tcpzc.DefaultMaxSendsInFlight)
 }
 
 // tcpzcPollTimeoutFromEnv resolves the ioLoop's wait window from
@@ -150,6 +183,13 @@ type tcpzcEndpoint struct {
 	sendCh   chan sendReq    // Send -> ioLoop (post a TX buffer)
 	txFreeCh chan uint32     // FREE TX buffer indices: SendBuf pops, ioLoop pushes
 	comps    chan completion // send-completion observation (interface contract)
+
+	// pending / hasPending hold the ONE send intent the tcpzc ordering gate
+	// refused with ErrTxBusy, so it is re-posted ahead of every later send and the
+	// route's byte order survives. Touched only by the ring goroutine
+	// (drainIntents), like the Conn itself, so no lock.
+	pending    sendReq
+	hasPending bool
 
 	ctx       context.Context
 	cancel    context.CancelFunc
@@ -185,6 +225,7 @@ func openTCPZCEndpointFd(fd int, name string) (zeroCopyEndpoint, error) {
 		RXCount:            rxN,
 		SmallSendThreshold: envUint32("NATS_TCPZC_ZC_THRESHOLD", tcpzc.DefaultSmallSendThreshold),
 		MaxSendChain:       tcpzcMaxSendChainFromEnv(),
+		MaxSendsInFlight:   tcpzcMaxSendsInFlightFromEnv(),
 	})
 	if err != nil {
 		return nil, err
@@ -353,20 +394,76 @@ func tcpzcDebugLine(name string, delta tcpzc.Stats, elapsed time.Duration) strin
 
 // drainIntents posts every queued Send / ReRecv without blocking. Runs on the
 // ring goroutine, so these are the only PostSend/PostRecv callers after open.
+//
+// Sends are posted STRICTLY IN ORDER and the order is load-bearing: these bytes
+// are one route's TCP stream, and two of them swapped is the design 58 P2e-5q
+// corruption. So when tcpzc's ordering gate refuses a post with ErrTxBusy, this
+// holds that one intent and returns rather than reaching for the next send —
+// posting a later message ahead of a deferred one would reorder the stream the
+// gate exists to protect. RX re-arming is independent of the gate and keeps
+// draining either way, so a gated TX half never starves RX.
 func (e *tcpzcEndpoint) drainIntents() {
+	// Retry the deferred send FIRST, and give up for this iteration if it is still
+	// refused: the gate opens when a send result reaps, which happens in the
+	// PollBatch that follows.
+	if e.hasPending {
+		if !e.postSend(e.pending) {
+			e.drainReRecv()
+			return
+		}
+		e.hasPending = false
+	}
 	for {
 		select {
 		case req := <-e.sendCh:
-			if serr := e.conn.PostSend(req.idx, req.length); serr != nil {
-				e.conn.Free(req.idx)
-				select {
-				case e.txFreeCh <- req.idx:
-				default:
-				}
+			if !e.postSend(req) {
+				e.pending, e.hasPending = req, true
+				e.drainReRecv()
+				return
 			}
 		case idx := <-e.reRecvCh:
 			// Republish to the provided-buffer ring: a memory write + tail
 			// advance, no SQE and no syscall (the RX batching win).
+			_ = e.conn.ReturnRecvBuf(idx)
+		default:
+			return
+		}
+	}
+}
+
+// postSend posts one send intent and reports whether it was CONSUMED. False means
+// only ErrTxBusy — the ordering gate is closed, nothing was submitted, the buffer
+// is still Free, and this exact intent must be re-posted before any later one.
+//
+// Any other error is terminal for that message and is handled as before: free the
+// buffer back to the TX pool and drop it. That is pre-existing behaviour and it is
+// not great (a dropped segment is a hole in the route stream, which dispatch tears
+// the route down for when it can detect it), but it is unchanged here and out of
+// scope for the gate.
+func (e *tcpzcEndpoint) postSend(req sendReq) bool {
+	serr := e.conn.PostSend(req.idx, req.length)
+	if serr == nil {
+		return true
+	}
+	if errors.Is(serr, tcpzc.ErrTxBusy) {
+		return false
+	}
+	e.conn.Free(req.idx)
+	select {
+	case e.txFreeCh <- req.idx:
+	default:
+	}
+	return true
+}
+
+// drainReRecv republishes every queued RX buffer without blocking. Split out of
+// drainIntents so a TX half stalled on the ordering gate still re-arms RX: the
+// provided-buffer ring starving would stop the route reading, which the gate has
+// no business causing.
+func (e *tcpzcEndpoint) drainReRecv() {
+	for {
+		select {
+		case idx := <-e.reRecvCh:
 			_ = e.conn.ReturnRecvBuf(idx)
 		default:
 			return
